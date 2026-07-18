@@ -1,9 +1,8 @@
 // Copyright 2025 ajbergh
 // SPDX-License-Identifier: Apache-2.0
 
-// Package handler — api_batch.go implements HTTP handlers for batch segment
-// rendering under /api/projects/{id}/batch-render and job cancellation at
-// PATCH /api/jobs/{id}/cancel.
+// Package handler — api_batch.go implements bounded-concurrency, cancellable
+// project rendering and single-segment production renders.
 package handler
 
 import (
@@ -11,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -28,6 +28,8 @@ import (
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/store"
 )
 
+const maxBatchConcurrency = 8
+
 // BatchHandler handles batch render and job cancellation endpoints.
 type BatchHandler struct {
 	Store         *store.Store
@@ -39,66 +41,68 @@ type BatchHandler struct {
 	cancels map[string]context.CancelFunc
 }
 
-// batchRenderBody is the optional request body for POST /api/projects/{id}/batch-render.
 type batchRenderBody struct {
-	// SegmentIDs limits the render to specific segments; empty renders all draft/changed.
-	SegmentIDs []int64 `json:"segment_ids,omitempty"`
-	// SegmentIDsLegacy accepts the old frontend camelCase payload for compatibility.
+	SegmentIDs       []int64 `json:"segment_ids,omitempty"`
 	SegmentIDsLegacy []int64 `json:"segmentIds,omitempty"`
-	// Force renders segments regardless of current status (bypasses draft/changed filter).
-	Force bool `json:"force,omitempty"`
+	Force            bool    `json:"force,omitempty"`
+	Concurrency      int     `json:"concurrency,omitempty"`
 }
 
-// batchRenderResponse is the immediate response returned to the caller before
-// the background render completes.
 type batchRenderResponse struct {
 	JobID        string `json:"job_id"`
 	SegmentCount int    `json:"segment_count"`
+	Concurrency  int    `json:"concurrency"`
 }
 
-// BatchRenderProject enqueues all eligible segments of a project for batch TTS
-// rendering.  It responds immediately with a job_id and launches a background
-// goroutine that emits progress events over WebSocket.
-//
-// POST /api/projects/{id}/batch-render
+type renderTask struct {
+	index          int
+	segment        store.ScriptSegment
+	originalStatus string
+}
+
+type renderResult struct {
+	task renderTask
+	err  error
+}
+
+// BatchRenderProject enqueues eligible project segments and returns immediately.
 func (h *BatchHandler) BatchRenderProject(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := parsePathInt64(w, r, "id", "invalid project ID")
 	if !ok {
 		return
 	}
-
 	var body batchRenderBody
-	// Body is optional — ignore decode errors
-	_ = decodeJSON(r, &body)
-
-	// Load project for default voice/model resolution.
+	if r.ContentLength > 0 {
+		if err := decodeJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
 	project, err := h.Store.GetProject(projectID)
 	if err != nil {
 		writeStoreError(w, err, "project not found", "failed to get project")
 		return
 	}
-
-	// Load all segments.
 	allSegments, err := h.Store.ListProjectSegments(projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list segments")
 		return
 	}
-
-	// Filter to renderable segments.
 	segmentIDs := body.SegmentIDs
 	if len(segmentIDs) == 0 {
 		segmentIDs = body.SegmentIDsLegacy
 	}
 	segments := filterRenderableSegments(allSegments, segmentIDs, body.Force)
 	if len(segments) == 0 {
-		writeError(w, http.StatusUnprocessableEntity, "no renderable segments found (all segments are up-to-date or project is empty)")
+		writeError(w, http.StatusUnprocessableEntity, "no renderable segments found")
 		return
 	}
 
+	concurrency := h.resolveBatchConcurrency(body.Concurrency)
+	if concurrency > len(segments) {
+		concurrency = len(segments)
+	}
 	jobID := fmt.Sprintf("batch_%d_%d", projectID, time.Now().UnixMilli())
-
-	// Register cancellation context.
 	ctx, cancel := context.WithCancel(context.Background())
 	h.mu.Lock()
 	if h.cancels == nil {
@@ -107,32 +111,18 @@ func (h *BatchHandler) BatchRenderProject(w http.ResponseWriter, r *http.Request
 	h.cancels[jobID] = cancel
 	h.mu.Unlock()
 
-	// Emit queued event before launching goroutine so the job appears in the
-	// frontend before the first WebSocket frame arrives.
 	if h.ProgressHub != nil {
 		h.ProgressHub.Broadcast(ProgressEvent{
-			JobID:      jobID,
-			Type:       "batch_render",
-			Status:     "queued",
-			Message:    fmt.Sprintf("Queued %d segments for rendering", len(segments)),
-			TotalItems: len(segments),
-			ProjectID:  fmt.Sprintf("%d", projectID),
+			JobID: jobID, Type: "batch_render", Status: "queued",
+			Message: fmt.Sprintf("Queued %d segments with %d worker(s)", len(segments), concurrency),
+			TotalItems: len(segments), ProjectID: fmt.Sprintf("%d", projectID),
 		})
 	}
-
-	go h.runBatchRender(ctx, jobID, projectID, project, segments)
-
-	writeJSON(w, http.StatusAccepted, batchRenderResponse{
-		JobID:        jobID,
-		SegmentCount: len(segments),
-	})
+	go h.runBatchRender(ctx, jobID, projectID, project, segments, concurrency)
+	writeJSON(w, http.StatusAccepted, batchRenderResponse{JobID: jobID, SegmentCount: len(segments), Concurrency: concurrency})
 }
 
-// RenderSegment renders a single segment on demand, creating a new SegmentTake
-// and updating the segment status.  This is the per-segment counterpart of
-// BatchRenderProject and reuses the same renderOneSegment logic.
-//
-// POST /api/projects/{id}/segments/{segmentId}/render
+// RenderSegment renders one segment synchronously and returns its newly-created take.
 func (h *BatchHandler) RenderSegment(w http.ResponseWriter, r *http.Request) {
 	projectID, ok := parsePathInt64(w, r, "id", "invalid project ID")
 	if !ok {
@@ -142,90 +132,73 @@ func (h *BatchHandler) RenderSegment(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-
 	project, err := h.Store.GetProject(projectID)
 	if err != nil {
 		writeStoreError(w, err, "project not found", "failed to get project")
 		return
 	}
-
 	segments, err := h.Store.ListProjectSegments(projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list segments")
 		return
 	}
-	var seg *store.ScriptSegment
-	for i := range segments {
-		if segments[i].ID == segmentID {
-			seg = &segments[i]
+	var segment *store.ScriptSegment
+	for index := range segments {
+		if segments[index].ID == segmentID {
+			segment = &segments[index]
 			break
 		}
 	}
-	if seg == nil {
+	if segment == nil {
 		writeError(w, http.StatusNotFound, "segment not found")
 		return
 	}
-	if seg.ScriptText == "" {
+	if strings.TrimSpace(segment.ScriptText) == "" {
 		writeError(w, http.StatusUnprocessableEntity, "segment has no script text")
 		return
 	}
 
-	ctx := r.Context()
+	originalStatus := segment.Status
 	_ = h.Store.UpdateSegmentStatus(projectID, segmentID, "rendering")
-
-	if err := h.renderOneSegment(ctx, projectID, project, *seg); err != nil {
-		_ = h.Store.UpdateSegmentStatus(projectID, segmentID, "failed")
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := h.renderOneSegment(r.Context(), projectID, project, *segment); err != nil {
+		status := "failed"
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			status = originalStatus
+		}
+		_ = h.Store.UpdateSegmentStatus(projectID, segmentID, status)
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-
-	// Return the newest take for this segment so the frontend can update its list.
 	takes, err := h.Store.ListSegmentTakes(projectID, segmentID)
 	if err != nil || len(takes) == 0 {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "rendered"})
+		writeError(w, http.StatusInternalServerError, "render completed without a persisted take")
 		return
 	}
 	writeJSON(w, http.StatusOK, takes[0])
 }
 
-// CancelJob cancels a running batch render job.
-//
-// PATCH /api/jobs/{id}/cancel
+// CancelJob cancels a running batch render job. The operation is idempotent.
 func (h *BatchHandler) CancelJob(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("id")
+	jobID := strings.TrimSpace(r.PathValue("id"))
 	if jobID == "" {
 		writeError(w, http.StatusBadRequest, "job ID is required")
 		return
 	}
-
 	h.mu.Lock()
 	cancel, found := h.cancels[jobID]
 	if found {
 		delete(h.cancels, jobID)
 	}
 	h.mu.Unlock()
-
 	if !found {
-		// Job may have already completed — return 200 (idempotent).
 		writeJSON(w, http.StatusOK, map[string]string{"status": "not_found"})
 		return
 	}
-
 	cancel()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
-// ---------------------------------------------------------------------------
-// Background render goroutine
-// ---------------------------------------------------------------------------
-
-func (h *BatchHandler) runBatchRender(
-	ctx context.Context,
-	jobID string,
-	projectID int64,
-	project *store.ScriptProject,
-	segments []store.ScriptSegment,
-) {
+func (h *BatchHandler) runBatchRender(ctx context.Context, jobID string, projectID int64, project *store.ScriptProject, segments []store.ScriptSegment, concurrency int) {
 	defer func() {
 		h.mu.Lock()
 		delete(h.cancels, jobID)
@@ -233,312 +206,339 @@ func (h *BatchHandler) runBatchRender(
 	}()
 
 	total := len(segments)
-	completed := 0
-	failed := 0
-	pidStr := fmt.Sprintf("%d", projectID)
-
-	emit := func(status, message string, percent, comp, fail int, segID int64) {
+	projectIDText := fmt.Sprintf("%d", projectID)
+	emit := func(status, message string, processed, completed, failed int, segmentID int64) {
 		if h.ProgressHub == nil {
 			return
 		}
-		ev := ProgressEvent{
-			JobID:          jobID,
-			Type:           "batch_render",
-			Status:         status,
-			Message:        message,
-			Percent:        percent,
-			TotalItems:     total,
-			CompletedItems: comp,
-			FailedItems:    fail,
-			ProjectID:      pidStr,
+		event := ProgressEvent{
+			JobID: jobID, Type: "batch_render", Status: status, Message: message,
+			Percent: completedPercent(processed, total), TotalItems: total,
+			CompletedItems: completed, FailedItems: failed, ProjectID: projectIDText,
 		}
-		if segID > 0 {
-			ev.SegmentID = fmt.Sprintf("%d", segID)
+		if segmentID > 0 {
+			event.SegmentID = fmt.Sprintf("%d", segmentID)
 		}
-		h.ProgressHub.Broadcast(ev)
+		h.ProgressHub.Broadcast(event)
 	}
+	emit("running", fmt.Sprintf("Rendering %d segments with %d worker(s)", total, concurrency), 0, 0, 0, 0)
 
-	emit("running", fmt.Sprintf("Rendering %d segments…", total), 0, 0, 0, 0)
-
-	for i, seg := range segments {
-		select {
-		case <-ctx.Done():
-			emit("cancelled", fmt.Sprintf("Cancelled after %d/%d segments", completed, total),
-				completedPercent(completed, total), completed, failed, seg.ID)
-			return
-		default:
+	tasks := make(chan renderTask)
+	results := make(chan renderResult, concurrency)
+	var workers sync.WaitGroup
+	for workerID := 0; workerID < concurrency; workerID++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case task, ok := <-tasks:
+					if !ok {
+						return
+					}
+					_ = h.Store.UpdateSegmentStatus(projectID, task.segment.ID, "rendering")
+					err := h.renderOneSegment(ctx, projectID, project, task.segment)
+					select {
+					case results <- renderResult{task: task, err: err}:
+					case <-ctx.Done():
+						if err != nil {
+							_ = h.Store.UpdateSegmentStatus(projectID, task.segment.ID, task.originalStatus)
+						}
+						return
+					}
+				}
+		}()
+	}
+	go func() {
+		defer close(tasks)
+		for index, segment := range segments {
+			task := renderTask{index: index, segment: segment, originalStatus: segment.Status}
+			select {
+			case tasks <- task:
+			case <-ctx.Done():
+				return
+			}
 		}
+	}()
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
 
-		_ = h.Store.UpdateSegmentStatus(projectID, seg.ID, "rendering")
-		emit("running",
-			fmt.Sprintf("Rendering segment %d of %d…", i+1, total),
-			completedPercent(i, total), completed, failed, seg.ID)
-
-		if err := h.renderOneSegment(ctx, projectID, project, seg); err != nil {
-			failed++
-			slog.Error("batch render: segment failed", "segment_id", seg.ID, "error", err)
-			_ = h.Store.UpdateSegmentStatus(projectID, seg.ID, "failed")
+	processed, completed, failed := 0, 0, 0
+	for result := range results {
+		processed++
+		if result.err != nil {
+			if errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded) {
+				_ = h.Store.UpdateSegmentStatus(projectID, result.task.segment.ID, result.task.originalStatus)
+			} else {
+				failed++
+				_ = h.Store.UpdateSegmentStatus(projectID, result.task.segment.ID, "failed")
+				slog.Error("batch render: segment failed", "segment_id", result.task.segment.ID, "error", result.err)
+			}
 		} else {
 			completed++
 		}
+		emit("running", fmt.Sprintf("Processed %d of %d segments", processed, total), processed, completed, failed, result.task.segment.ID)
 	}
 
-	finalStatus := "complete"
-	if failed == total {
-		finalStatus = "failed"
+	if ctx.Err() != nil {
+		for _, segment := range segments {
+			if segment.Status == "rendering" {
+				_ = h.Store.UpdateSegmentStatus(projectID, segment.ID, segment.Status)
+			}
+		}
+		emit("cancelled", fmt.Sprintf("Cancelled after %d/%d segments", processed, total), processed, completed, failed, 0)
+		return
 	}
-	emit(finalStatus,
-		fmt.Sprintf("Rendered %d/%d segments (%d failed)", completed, total, failed),
-		100, completed, failed, 0)
+	status := "complete"
+	if failed == total {
+		status = "failed"
+	} else if failed > 0 {
+		status = "partial"
+	}
+	emit(status, fmt.Sprintf("Rendered %d/%d segments (%d failed)", completed, total, failed), total, completed, failed, 0)
 }
 
-// renderOneSegment calls Gemini TTS for a single segment, persists the audio,
-// creates a SegmentTake, and updates the segment status to "rendered".
-func (h *BatchHandler) renderOneSegment(
-	ctx context.Context,
-	projectID int64,
-	project *store.ScriptProject,
-	seg store.ScriptSegment,
-) error {
-	// Resolve voice/persona: cast profile → segment override → project/preset default.
-	voiceName := derefStr(seg.VoiceName)
-	castLangCode := ""
-	var pbIn promptbuilder.Input
+func (h *BatchHandler) resolveBatchConcurrency(requested int) int {
+	value := requested
+	if value <= 0 {
+		value = 2
+		if raw := strings.TrimSpace(h.Store.GetConfigValue(store.ConfigKeyDefaultBatchConcurrency, "2")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				value = parsed
+			}
+		}
+	}
+	if value < 1 {
+		value = 1
+	}
+	if value > maxBatchConcurrency {
+		value = maxBatchConcurrency
+	}
+	return value
+}
+
+// renderOneSegment resolves production settings, generates audio, durably
+// persists the file and take, creates automated QC, and only then marks the
+// segment rendered.
+func (h *BatchHandler) renderOneSegment(ctx context.Context, projectID int64, project *store.ScriptProject, segment store.ScriptSegment) error {
+	voiceName := derefStr(segment.VoiceName)
+	castLanguage := ""
+	var promptInput promptbuilder.Input
 	var castProfileID *int64
 	var presetID *int64
-
-	// Resolve cast profile: voice, language, persona.
-	if seg.CastProfileID != nil {
-		if profile, perr := h.Store.GetCastProfile(*seg.CastProfileID); perr == nil {
-			castProfileID = seg.CastProfileID
+	if segment.CastProfileID != nil {
+		if profile, err := h.Store.GetCastProfile(*segment.CastProfileID); err == nil {
+			castProfileID = segment.CastProfileID
 			if profile.VoiceName != nil && *profile.VoiceName != "" {
 				voiceName = *profile.VoiceName
 			}
 			if profile.LanguageCode != nil {
-				castLangCode = *profile.LanguageCode
+				castLanguage = *profile.LanguageCode
 			}
-			pbIn.CastRole = profile.Role
-			pbIn.CastDescription = profile.Description
-			pbIn.CastPronunciationNotes = derefStr(profile.PronunciationNotes)
-
-			// Resolve style from cast profile if segment has no override.
-			if seg.StyleID == nil && profile.StyleID != nil {
-				seg.StyleID = profile.StyleID
+			promptInput.CastRole = profile.Role
+			promptInput.CastDescription = profile.Description
+			promptInput.CastPronunciationNotes = derefStr(profile.PronunciationNotes)
+			if segment.StyleID == nil && profile.StyleID != nil {
+				segment.StyleID = profile.StyleID
 			}
-			if seg.PresetID == nil && profile.PresetID != nil {
-				seg.PresetID = profile.PresetID
+			if segment.PresetID == nil && profile.PresetID != nil {
+				segment.PresetID = profile.PresetID
 			}
 		}
 	}
-	presetID = seg.PresetID
+	presetID = segment.PresetID
 	if presetID == nil {
 		presetID = project.DefaultPresetID
 	}
 	if presetID != nil {
-		if preset, perr := h.Store.GetCustomPreset(*presetID); perr == nil {
+		if preset, err := h.Store.GetCustomPreset(*presetID); err == nil {
 			if voiceName == "" {
 				voiceName = preset.VoiceName
 			}
-			pbIn.PresetInstruction = derefStr(preset.SystemInstruction)
+			promptInput.PresetInstruction = derefStr(preset.SystemInstruction)
 		}
 	}
 	if voiceName == "" {
 		voiceName = derefStr(project.DefaultVoiceName)
 	}
 	if voiceName == "" {
-		return fmt.Errorf("segment %d: no voice configured", seg.ID)
+		return fmt.Errorf("segment %d: no voice configured", segment.ID)
 	}
 
-	provider := h.resolveProvider(project, seg)
-	model := h.resolveModel(provider, project, seg)
-	langCode := derefStr(seg.LanguageCode)
-	if langCode == "" {
-		langCode = castLangCode
+	provider := h.resolveProvider(project, segment)
+	model := h.resolveModel(provider, project, segment)
+	if err := gemini.ValidateTTSModel(model); err != nil {
+		return fmt.Errorf("segment %d: %w", segment.ID, err)
 	}
-	if langCode == "" {
-		langCode = derefStr(project.DefaultLanguageCode)
+	languageCode := derefStr(segment.LanguageCode)
+	if languageCode == "" {
+		languageCode = castLanguage
 	}
-	if langCode == "" {
-		langCode, _ = h.Store.GetConfig(store.ConfigKeyDefaultLanguageCode)
+	if languageCode == "" {
+		languageCode = derefStr(project.DefaultLanguageCode)
+	}
+	if languageCode == "" {
+		languageCode, _ = h.Store.GetConfig(store.ConfigKeyDefaultLanguageCode)
 	}
 
 	appVoiceName := voiceName
 	providerVoice, err := h.resolveProviderVoice(projectID, "gemini", appVoiceName, provider)
 	if err != nil {
-		return fmt.Errorf("segment %d: %w", seg.ID, err)
+		return fmt.Errorf("segment %d: %w", segment.ID, err)
 	}
-
-	fallbackProvider := h.resolveFallbackProvider(project, seg)
-	fallbackModel := h.resolveFallbackModel(fallbackProvider, project, seg)
+	fallbackProvider := h.resolveFallbackProvider(project, segment)
+	fallbackModel := h.resolveFallbackModel(fallbackProvider, project, segment)
 	fallbackVoice := ""
 	if fallbackProvider != "" && fallbackProvider != provider {
 		fallbackVoice, err = h.resolveProviderVoice(projectID, "gemini", appVoiceName, fallbackProvider)
 		if err != nil {
-			return fmt.Errorf("segment %d fallback: %w", seg.ID, err)
+			return fmt.Errorf("segment %d fallback: %w", segment.ID, err)
 		}
 	}
 
-	// Resolve style: segment → cast profile → project default.
-	styleID := seg.StyleID
+	styleID := segment.StyleID
 	if styleID == nil {
 		styleID = project.DefaultStyleID
 	}
 	if styleID != nil {
-		if style, serr := h.Store.GetStyle(*styleID); serr == nil {
-			pbIn.StyleName = style.Name
-			pbIn.StyleDirectorNotes = style.DirectorNotes
-			pbIn.StylePacing = derefStr(style.Pacing)
-			pbIn.StyleEnergy = derefStr(style.Energy)
-			pbIn.StyleEmotion = derefStr(style.Emotion)
-			pbIn.StyleArticulation = derefStr(style.Articulation)
-			pbIn.StylePauseDensity = derefStr(style.PauseDensity)
+		if style, err := h.Store.GetStyle(*styleID); err == nil {
+			promptInput.StyleName = style.Name
+			promptInput.StyleDirectorNotes = style.DirectorNotes
+			promptInput.StylePacing = derefStr(style.Pacing)
+			promptInput.StyleEnergy = derefStr(style.Energy)
+			promptInput.StyleEmotion = derefStr(style.Emotion)
+			promptInput.StyleArticulation = derefStr(style.Articulation)
+			promptInput.StylePauseDensity = derefStr(style.PauseDensity)
 		}
 	}
-
-	// Check for cancellation before making the network call.
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	// Apply pronunciation dictionary if the project has any enabled entries.
-	renderText := seg.ScriptText
-	var dictionaryHash string
+	renderText := segment.ScriptText
+	dictionaryHash := ""
 	if entries, err := h.Store.ListEnabledEntriesForProject(projectID); err == nil && len(entries) > 0 {
 		dictionaryHash = hashPronunciationEntries(entries)
 		renderText = pronunciation.ApplyDictionary(renderText, entries)
 	}
-
-	// Compose system instruction via promptbuilder.
-	systemInstruction, promptHash := promptbuilder.Compose(pbIn)
-
-	audioBase64, usedProvider, usedModel, usedProviderVoice, usedFallback, err := h.generateWithFallback(
-		ctx,
-		seg,
-		renderText,
-		systemInstruction,
-		langCode,
-		provider,
-		model,
-		providerVoice,
-		fallbackProvider,
-		fallbackModel,
-		fallbackVoice,
+	systemInstruction, promptHash := promptbuilder.Compose(promptInput)
+	audioBase64, usedProvider, usedModel, usedVoice, usedFallback, err := h.generateWithFallback(
+		ctx, segment, renderText, systemInstruction, languageCode,
+		provider, model, providerVoice, fallbackProvider, fallbackModel, fallbackVoice,
 	)
 	if err != nil {
-		return fmt.Errorf("segment %d: TTS: %w", seg.ID, err)
+		return fmt.Errorf("segment %d: TTS: %w", segment.ID, err)
 	}
-
-	// Decode PCM audio.
 	audioBytes, err := base64.StdEncoding.DecodeString(audioBase64)
 	if err != nil {
-		return fmt.Errorf("segment %d: decode audio: %w", seg.ID, err)
+		return fmt.Errorf("segment %d: decode audio: %w", segment.ID, err)
+	}
+	if len(audioBytes) == 0 {
+		return fmt.Errorf("segment %d: provider returned empty audio", segment.ID)
+	}
+	if strings.TrimSpace(h.AudioCacheDir) == "" {
+		return fmt.Errorf("segment %d: audio storage is not configured", segment.ID)
+	}
+	if err := os.MkdirAll(h.AudioCacheDir, 0o700); err != nil {
+		return fmt.Errorf("segment %d: create audio storage: %w", segment.ID, err)
 	}
 
-	// Persist audio to cache directory.
-	var audioPath *string
-	if h.AudioCacheDir != "" {
-		safeName := sanitizeForFilename(usedProviderVoice)
-		filename := fmt.Sprintf("batch_%d_%d_%d_%s.raw", projectID, seg.ID, time.Now().UnixMilli(), safeName)
-		if cachePath, ok := safeCachePath(h.AudioCacheDir, filename); ok {
-			if writeErr := os.WriteFile(cachePath, audioBytes, 0o600); writeErr == nil {
-				audioPath = &cachePath
-			} else {
-				slog.Warn("batch render: failed to cache audio", "segment_id", seg.ID, "error", writeErr)
-			}
-		}
+	safeVoice := sanitizeForFilename(usedVoice)
+	filename := fmt.Sprintf("take_%d_%d_%d_%s.raw", projectID, segment.ID, time.Now().UnixNano(), safeVoice)
+	finalPath, ok := safeCachePath(h.AudioCacheDir, filename)
+	if !ok {
+		return fmt.Errorf("segment %d: invalid audio path", segment.ID)
 	}
+	temporary, err := os.CreateTemp(h.AudioCacheDir, ".render-*.raw")
+	if err != nil {
+		return fmt.Errorf("segment %d: create temporary audio: %w", segment.ID, err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("segment %d: secure temporary audio: %w", segment.ID, err)
+	}
+	if _, err := temporary.Write(audioBytes); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("segment %d: write temporary audio: %w", segment.ID, err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("segment %d: sync temporary audio: %w", segment.ID, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("segment %d: close temporary audio: %w", segment.ID, err)
+	}
+	if err := os.Rename(temporaryPath, finalPath); err != nil {
+		return fmt.Errorf("segment %d: publish audio: %w", segment.ID, err)
+	}
+	published := true
+	defer func() {
+		if published {
+			_ = os.Remove(finalPath)
+		}
+	}()
 
 	metrics := audioanalysis.AnalyzePCM16LE(audioBytes, audioanalysis.DefaultSampleRate, audioanalysis.DefaultChannels)
-	sampleRate := metrics.SampleRate
-	channels := metrics.Channels
-	format := metrics.Format
-	voiceNameForTake := appVoiceName
-	providerVoiceForTake := usedProviderVoice
-	providerForTake := usedProvider
-	modelForTakeValue := usedModel
-
-	var langCodeForTake *string
-	if langCode != "" {
-		langCodeForTake = &langCode
+	sampleRate, channels, format := metrics.SampleRate, metrics.Channels, metrics.Format
+	providerForTake, providerVoiceForTake, voiceForTake := usedProvider, usedVoice, appVoiceName
+	var languageForTake, modelForTake, instructionForTake *string
+	if languageCode != "" {
+		languageForTake = &languageCode
 	}
-	var modelForTake *string
-	if modelForTakeValue != "" {
-		modelForTake = &modelForTakeValue
+	if usedModel != "" {
+		modelForTake = &usedModel
 	}
-	var sysInstrForTake *string
 	if systemInstruction != "" {
-		sysInstrForTake = &systemInstruction
+		instructionForTake = &systemInstruction
 	}
 	settingsJSON := marshalRenderSettings(map[string]any{
-		"provider":          usedProvider,
-		"model":             usedModel,
-		"provider_voice":    usedProviderVoice,
-		"app_voice_name":    appVoiceName,
-		"fallback_provider": fallbackProvider,
-		"fallback_model":    fallbackModel,
-		"used_fallback":     usedFallback,
-		"dictionary_hash":   dictionaryHash,
-		"prompt_hash":       promptHash,
+		"requested_provider": provider, "requested_model": model, "provider": usedProvider,
+		"model": usedModel, "provider_voice": usedVoice, "app_voice_name": appVoiceName,
+		"fallback_provider": fallbackProvider, "fallback_model": fallbackModel,
+		"used_fallback": usedFallback, "dictionary_hash": dictionaryHash, "prompt_hash": promptHash,
 	})
-
-	// Create a SegmentTake record.
-	take := store.SegmentTake{
-		ProjectID:         projectID,
-		SegmentID:         seg.ID,
-		VoiceName:         &voiceNameForTake,
-		SpeakerLabel:      seg.SpeakerLabel,
-		LanguageCode:      langCodeForTake,
-		Provider:          &providerForTake,
-		Model:             modelForTake,
-		ProviderVoice:     &providerVoiceForTake,
-		AppVoiceName:      &voiceNameForTake,
-		PresetID:          presetID,
-		StyleID:           styleID,
-		AccentID:          seg.AccentID,
-		CastProfileID:     castProfileID,
-		DictionaryHash:    optionalStringPtr(dictionaryHash),
-		PromptHash:        optionalStringPtr(promptHash),
-		SettingsJSON:      settingsJSON,
-		SystemInstruction: sysInstrForTake,
-		ScriptText:        seg.ScriptText,
-		AudioPath:         audioPath,
-		DurationSeconds:   &metrics.DurationSeconds,
-		PeakDbfs:          finiteFloatPtr(metrics.PeakDbfs),
-		RmsDbfs:           finiteFloatPtr(metrics.RmsDbfs),
-		ClippingDetected:  metrics.ClippingDetected,
-		SampleRate:        &sampleRate,
-		Channels:          &channels,
-		Format:            &format,
-		Status:            "rendered",
-	}
-	takeID, err := h.Store.CreateTake(take)
+	takeID, err := h.Store.CreateTake(store.SegmentTake{
+		ProjectID: projectID, SegmentID: segment.ID, VoiceName: &voiceForTake,
+		SpeakerLabel: segment.SpeakerLabel, LanguageCode: languageForTake,
+		Provider: &providerForTake, Model: modelForTake, ProviderVoice: &providerVoiceForTake,
+		AppVoiceName: &voiceForTake, PresetID: presetID, StyleID: styleID,
+		AccentID: segment.AccentID, CastProfileID: castProfileID,
+		DictionaryHash: optionalStringPtr(dictionaryHash), PromptHash: optionalStringPtr(promptHash),
+		SettingsJSON: settingsJSON, SystemInstruction: instructionForTake, ScriptText: segment.ScriptText,
+		AudioPath: &finalPath, DurationSeconds: &metrics.DurationSeconds,
+		PeakDbfs: finiteFloatPtr(metrics.PeakDbfs), RmsDbfs: finiteFloatPtr(metrics.RmsDbfs),
+		ClippingDetected: metrics.ClippingDetected, SampleRate: &sampleRate, Channels: &channels,
+		Format: &format, Status: "rendered",
+	})
 	if err != nil {
-		slog.Warn("batch render: failed to create take", "segment_id", seg.ID, "error", err)
-		// Non-fatal: still mark the segment rendered.
-	} else if h.shouldCreateClippingIssue(metrics) {
-		note := fmt.Sprintf("Rendered audio peaks at %.2f dBFS and should be reviewed for clipping or limiter artifacts.", metrics.PeakDbfs)
+		return fmt.Errorf("segment %d: persist take: %w", segment.ID, err)
+	}
+	published = false
+
+	if h.shouldCreateClippingIssue(metrics) {
+		note := fmt.Sprintf("Rendered audio peaks at %.2f dBFS and should be reviewed for limiter artifacts.", metrics.PeakDbfs)
 		if metrics.ClippingDetected {
 			note = "Rendered audio contains clipped PCM samples and should be reviewed for distortion."
 		}
 		if _, err := h.Store.CreateQcIssue(store.QcIssue{
-			ProjectID: projectID,
-			SegmentID: seg.ID,
-			TakeID:    &takeID,
-			IssueType: "volume",
-			Severity:  "high",
-			Note:      note,
-			Status:    "open",
+			ProjectID: projectID, SegmentID: segment.ID, TakeID: &takeID,
+			IssueType: "volume", Severity: "high", Note: note, Status: "open",
 		}); err != nil {
-			slog.Warn("batch render: failed to create clipping qc issue", "segment_id", seg.ID, "take_id", takeID, "error", err)
+			slog.Warn("batch render: create clipping QC issue", "segment_id", segment.ID, "take_id", takeID, "error", err)
 		}
 	}
-
-	return h.Store.UpdateSegmentStatus(projectID, seg.ID, "rendered")
+	if err := h.Store.UpdateSegmentStatus(projectID, segment.ID, "rendered"); err != nil {
+		return fmt.Errorf("segment %d: update rendered status: %w", segment.ID, err)
+	}
+	return nil
 }
 
-// shouldCreateClippingIssue applies QC config to rendered audio metrics.
 func (h *BatchHandler) shouldCreateClippingIssue(metrics audioanalysis.Analysis) bool {
 	if !strings.EqualFold(h.Store.GetConfigValue(store.ConfigKeyQcAutoFlagClipping, "true"), "true") {
 		return false
@@ -558,44 +558,34 @@ func (h *BatchHandler) shouldCreateClippingIssue(metrics audioanalysis.Analysis)
 	return metrics.PeakDbfs >= threshold
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// filterRenderableSegments returns segments eligible for rendering.
-// If segmentIDs is non-empty, only those IDs are considered.
-// Unless force is true, only statuses that need audio are included.
 func filterRenderableSegments(segments []store.ScriptSegment, ids []int64, force bool) []store.ScriptSegment {
-	idSet := make(map[int64]bool, len(ids))
+	selected := make(map[int64]bool, len(ids))
 	for _, id := range ids {
-		idSet[id] = true
+		selected[id] = true
 	}
-
-	var out []store.ScriptSegment
-	for _, seg := range segments {
-		if len(idSet) > 0 && !idSet[seg.ID] {
+	out := make([]store.ScriptSegment, 0, len(segments))
+	for _, segment := range segments {
+		if len(selected) > 0 && !selected[segment.ID] {
 			continue
 		}
-		if !force && seg.Status != "draft" && seg.Status != "changed" && seg.Status != "failed" {
+		if !force && segment.Status != "draft" && segment.Status != "changed" && segment.Status != "failed" {
 			continue
 		}
-		if seg.ScriptText == "" {
+		if strings.TrimSpace(segment.ScriptText) == "" {
 			continue
 		}
-		out = append(out, seg)
+		out = append(out, segment)
 	}
 	return out
 }
 
-// derefStr dereferences a *string safely, returning "" for nil.
-func derefStr(s *string) string {
-	if s == nil {
+func derefStr(value *string) string {
+	if value == nil {
 		return ""
 	}
-	return *s
+	return *value
 }
 
-// finiteFloatPtr converts invalid floating-point metrics to nil for JSON/database use.
 func finiteFloatPtr(value float64) *float64 {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return nil
@@ -603,7 +593,6 @@ func finiteFloatPtr(value float64) *float64 {
 	return &value
 }
 
-// optionalStringPtr trims empty strings to nil for nullable render metadata.
 func optionalStringPtr(value string) *string {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -611,7 +600,6 @@ func optionalStringPtr(value string) *string {
 	return &value
 }
 
-// marshalRenderSettings stores reproducible render settings as JSON.
 func marshalRenderSettings(value map[string]any) *string {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -621,22 +609,20 @@ func marshalRenderSettings(value map[string]any) *string {
 	return &out
 }
 
-// hashPronunciationEntries fingerprints enabled pronunciation rules used for a render.
 func hashPronunciationEntries(entries []store.PronunciationEntry) string {
 	if len(entries) == 0 {
 		return ""
 	}
-	h := sha256.New()
-	for _, e := range entries {
-		fmt.Fprintf(h, "%d|%d|%s|%s|%t|%t|%d\n",
-			e.ID, e.DictionaryID, e.RawWord, e.Replacement, e.IsRegex, e.Enabled, e.SortOrder)
+	hash := sha256.New()
+	for _, entry := range entries {
+		_, _ = fmt.Fprintf(hash, "%d|%d|%s|%s|%t|%t|%d\n",
+			entry.ID, entry.DictionaryID, entry.RawWord, entry.Replacement, entry.IsRegex, entry.Enabled, entry.SortOrder)
 	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
-// resolveProvider selects the effective TTS provider from segment, project, client, or global defaults.
-func (h *BatchHandler) resolveProvider(project *store.ScriptProject, seg store.ScriptSegment) string {
-	if value := derefStr(seg.Provider); value != "" {
+func (h *BatchHandler) resolveProvider(project *store.ScriptProject, segment store.ScriptSegment) string {
+	if value := derefStr(segment.Provider); value != "" {
 		return normalizeProvider(value)
 	}
 	if value := derefStr(project.DefaultProvider); value != "" {
@@ -655,25 +641,20 @@ func (h *BatchHandler) resolveProvider(project *store.ScriptProject, seg store.S
 	return "gemini"
 }
 
-// resolveModel selects a provider-compatible model from segment, project, client, or global defaults.
-func (h *BatchHandler) resolveModel(provider string, project *store.ScriptProject, seg store.ScriptSegment) string {
-	if value := derefStr(seg.Model); value != "" {
+func (h *BatchHandler) resolveModel(provider string, project *store.ScriptProject, segment store.ScriptSegment) string {
+	if value := derefStr(segment.Model); value != "" {
 		return value
 	}
-	if normalizeProviderIfSet(derefStr(seg.Provider)) != "" {
+	if normalizeProviderIfSet(derefStr(segment.Provider)) != "" {
 		return defaultModelForProvider(provider)
 	}
-	if value := derefStr(project.DefaultModel); value != "" {
-		if defaultModelUsableForProvider(provider, derefStr(project.DefaultProvider), value) {
-			return value
-		}
+	if value := derefStr(project.DefaultModel); value != "" && defaultModelUsableForProvider(provider, derefStr(project.DefaultProvider), value) {
+		return value
 	}
 	if project.ClientID != nil {
 		if client, err := h.Store.GetClient(*project.ClientID); err == nil {
-			if value := derefStr(client.DefaultModel); value != "" {
-				if defaultModelUsableForProvider(provider, derefStr(client.DefaultProvider), value) {
-					return value
-				}
+			if value := derefStr(client.DefaultModel); value != "" && defaultModelUsableForProvider(provider, derefStr(client.DefaultProvider), value) {
+				return value
 			}
 		}
 	}
@@ -686,9 +667,8 @@ func (h *BatchHandler) resolveModel(provider string, project *store.ScriptProjec
 	return defaultModelForProvider(provider)
 }
 
-// resolveFallbackProvider selects the optional fallback provider for failed renders.
-func (h *BatchHandler) resolveFallbackProvider(project *store.ScriptProject, seg store.ScriptSegment) string {
-	if value := derefStr(seg.FallbackProvider); value != "" {
+func (h *BatchHandler) resolveFallbackProvider(project *store.ScriptProject, segment store.ScriptSegment) string {
+	if value := derefStr(segment.FallbackProvider); value != "" {
 		return normalizeProvider(value)
 	}
 	if value := derefStr(project.FallbackProvider); value != "" {
@@ -707,28 +687,23 @@ func (h *BatchHandler) resolveFallbackProvider(project *store.ScriptProject, seg
 	return ""
 }
 
-// resolveFallbackModel selects a provider-compatible fallback model.
-func (h *BatchHandler) resolveFallbackModel(provider string, project *store.ScriptProject, seg store.ScriptSegment) string {
+func (h *BatchHandler) resolveFallbackModel(provider string, project *store.ScriptProject, segment store.ScriptSegment) string {
 	if provider == "" {
 		return ""
 	}
-	if value := derefStr(seg.FallbackModel); value != "" {
+	if value := derefStr(segment.FallbackModel); value != "" {
 		return value
 	}
-	if normalizeProviderIfSet(derefStr(seg.FallbackProvider)) != "" {
+	if normalizeProviderIfSet(derefStr(segment.FallbackProvider)) != "" {
 		return defaultModelForProvider(provider)
 	}
-	if value := derefStr(project.FallbackModel); value != "" {
-		if defaultModelUsableForProvider(provider, derefStr(project.FallbackProvider), value) {
-			return value
-		}
+	if value := derefStr(project.FallbackModel); value != "" && defaultModelUsableForProvider(provider, derefStr(project.FallbackProvider), value) {
+		return value
 	}
 	if project.ClientID != nil {
 		if client, err := h.Store.GetClient(*project.ClientID); err == nil {
-			if value := derefStr(client.FallbackModel); value != "" {
-				if defaultModelUsableForProvider(provider, derefStr(client.FallbackProvider), value) {
-					return value
-				}
+			if value := derefStr(client.FallbackModel); value != "" && defaultModelUsableForProvider(provider, derefStr(client.FallbackProvider), value) {
+				return value
 			}
 		}
 	}
@@ -741,73 +716,50 @@ func (h *BatchHandler) resolveFallbackModel(provider string, project *store.Scri
 	return defaultModelForProvider(provider)
 }
 
-// resolveProviderVoice maps the app voice to the selected provider voice.
 func (h *BatchHandler) resolveProviderVoice(projectID int64, sourceProvider, sourceVoice, targetProvider string) (string, error) {
-	// This application is Gemini-only. The source voice is always a Gemini voice
-	// and is passed through unchanged — no cross-provider mapping is needed.
 	_ = projectID
 	_ = sourceProvider
 	_ = targetProvider
 	return sourceVoice, nil
 }
 
-// generateWithFallback attempts primary TTS first, then the configured fallback when allowed.
-func (h *BatchHandler) generateWithFallback(
-	ctx context.Context,
-	seg store.ScriptSegment,
-	text string,
-	systemInstruction string,
-	languageCode string,
-	provider string,
-	model string,
-	providerVoice string,
-	fallbackProvider string,
-	fallbackModel string,
-	fallbackVoice string,
-) (audioBase64, usedProvider, usedModel, usedProviderVoice string, usedFallback bool, err error) {
-	audioBase64, err = h.generateProviderTTS(ctx, provider, model, providerVoice, text, systemInstruction, languageCode)
+func (h *BatchHandler) generateWithFallback(ctx context.Context, segment store.ScriptSegment, text, instruction, languageCode, provider, model, voice, fallbackProvider, fallbackModel, fallbackVoice string) (audioBase64, usedProvider, usedModel, usedVoice string, usedFallback bool, err error) {
+	audioBase64, err = h.generateProviderTTS(ctx, provider, model, voice, text, instruction, languageCode)
 	if err == nil {
-		return audioBase64, provider, model, providerVoice, false, nil
+		return audioBase64, provider, model, voice, false, nil
 	}
-	if fallbackProvider == "" || fallbackProvider == provider || !fallbackAllowedForSegment(seg) {
-		return "", provider, model, providerVoice, false, err
+	if fallbackProvider == "" || fallbackProvider == provider || !fallbackAllowedForSegment(segment) {
+		return "", provider, model, voice, false, err
 	}
 	if fallbackModel == "" {
 		fallbackModel = defaultModelForProvider(fallbackProvider)
 	}
-	audioBase64, fallbackErr := h.generateProviderTTS(ctx, fallbackProvider, fallbackModel, fallbackVoice, text, systemInstruction, languageCode)
+	audioBase64, fallbackErr := h.generateProviderTTS(ctx, fallbackProvider, fallbackModel, fallbackVoice, text, instruction, languageCode)
 	if fallbackErr != nil {
-		return "", provider, model, providerVoice, false, fmt.Errorf("%w; fallback %s also failed: %v", err, fallbackProvider, fallbackErr)
+		return "", provider, model, voice, false, fmt.Errorf("%w; fallback %s also failed: %v", err, fallbackProvider, fallbackErr)
 	}
 	return audioBase64, fallbackProvider, fallbackModel, fallbackVoice, true, nil
 }
 
-// generateProviderTTS performs the provider-specific TTS call for one segment.
-func (h *BatchHandler) generateProviderTTS(
-	ctx context.Context,
-	provider string,
-	model string,
-	voice string,
-	text string,
-	systemInstruction string,
-	languageCode string,
-) (string, error) {
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	default:
+func (h *BatchHandler) generateProviderTTS(ctx context.Context, provider, model, voice, text, instruction, languageCode string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	// This application is Gemini-only. All provider values are normalised to "gemini".
+	if normalizeProvider(provider) != "gemini" {
+		return "", fmt.Errorf("unsupported provider %q", provider)
+	}
+	if err := gemini.ValidateTTSModel(model); err != nil {
+		return "", err
+	}
 	apiKey, err := h.KeysHandler.GetDecryptedKey("gemini")
 	if err != nil {
 		return "", fmt.Errorf("no Gemini API key: %w", err)
 	}
-	return gemini.NewClient(apiKey).GenerateTTS(text, voice, systemInstruction, languageCode, model)
+	return gemini.NewClient(apiKey).GenerateTTSContext(ctx, text, voice, instruction, languageCode, model)
 }
 
-// fallbackAllowedForSegment prevents fallback replacement for approved or locked work.
-func fallbackAllowedForSegment(seg store.ScriptSegment) bool {
-	switch strings.ToLower(seg.Status) {
+func fallbackAllowedForSegment(segment store.ScriptSegment) bool {
+	switch strings.ToLower(segment.Status) {
 	case "approved", "locked":
 		return false
 	default:
@@ -815,18 +767,16 @@ func fallbackAllowedForSegment(seg store.ScriptSegment) bool {
 	}
 }
 
-// defaultModelForProvider returns the registry default for a normalized provider ID.
 func defaultModelForProvider(provider string) string {
 	provider = normalizeProvider(provider)
-	for _, p := range registry {
-		if strings.EqualFold(p.ID, provider) {
-			return p.DefaultModel
+	for _, registered := range registry {
+		if strings.EqualFold(registered.ID, provider) {
+			return registered.DefaultModel
 		}
 	}
-	return "gemini-2.5-flash-preview-tts"
+	return "gemini-3.1-flash-tts-preview"
 }
 
-// defaultModelUsableForProvider checks whether an inherited model matches the selected provider.
 func defaultModelUsableForProvider(provider, configuredProvider, model string) bool {
 	if configuredProvider = normalizeProviderIfSet(configuredProvider); configuredProvider != "" && configuredProvider != provider {
 		return false
@@ -834,49 +784,35 @@ func defaultModelUsableForProvider(provider, configuredProvider, model string) b
 	return modelCompatibleWithProvider(provider, model)
 }
 
-// modelCompatibleWithProvider rejects known models that belong to a different provider.
 func modelCompatibleWithProvider(provider, model string) bool {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return true
 	}
 	provider = normalizeProvider(provider)
-	foundProvider := false
-	modelBelongsToOtherProvider := false
-	for _, p := range registry {
-		matchesProvider := strings.EqualFold(p.ID, provider)
-		if matchesProvider {
-			foundProvider = true
+	for _, registered := range registry {
+		if !strings.EqualFold(registered.ID, provider) {
+			continue
 		}
-		for _, candidate := range p.Models {
-			if !strings.EqualFold(candidate.ID, model) {
-				continue
-			}
-			if matchesProvider {
+		for _, candidate := range registered.Models {
+			if strings.EqualFold(candidate.ID, model) {
 				return true
 			}
-			modelBelongsToOtherProvider = true
 		}
+		return false
 	}
-	if !foundProvider {
-		return true
-	}
-	return !modelBelongsToOtherProvider
+	return false
 }
 
-// normalizeProvider canonicalizes provider IDs and migrates legacy values to Gemini.
 func normalizeProvider(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "", "google", "google-gemini", "openai":
-		// All non-Gemini provider values are coerced to "gemini".
-		// This handles legacy DB rows that may still carry provider = "openai".
 		return "gemini"
 	default:
 		return strings.ToLower(strings.TrimSpace(provider))
 	}
 }
 
-// normalizeProviderIfSet preserves an unset provider while normalizing non-empty values.
 func normalizeProviderIfSet(provider string) string {
 	if strings.TrimSpace(provider) == "" {
 		return ""
@@ -884,14 +820,13 @@ func normalizeProviderIfSet(provider string) string {
 	return normalizeProvider(provider)
 }
 
-// completedPercent returns an integer 0-99 progress percentage.
 func completedPercent(done, total int) int {
-	if total == 0 {
+	if total <= 0 {
 		return 0
 	}
-	p := (done * 100) / total
-	if p > 99 {
-		p = 99
+	percentage := (done * 100) / total
+	if percentage > 100 {
+		return 100
 	}
-	return p
+	return percentage
 }
