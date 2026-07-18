@@ -5,7 +5,9 @@
 package handler
 
 import (
+	"errors"
 	"encoding/json"
+	"io"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -30,14 +32,14 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// writeError keeps the historical string `error` field while adding a stable
+// machine-readable code and retry hint for typed frontend handling.
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{
-		"error": map[string]any{
-			"code":       errorCodeForStatus(status),
-			"message":    message,
-			"retryable":  status == http.StatusTooManyRequests || status >= 500,
-			"http_status": status,
-		},
+		"error":      message,
+		"code":       errorCodeForStatus(status),
+		"retryable":  status == http.StatusTooManyRequests || status >= 500,
+		"http_status": status,
 	})
 }
 
@@ -69,8 +71,8 @@ func errorCodeForStatus(status int) string {
 	}
 }
 
-// decodeJSON reads and decodes one JSON value, rejects trailing content, and
-// limits bodies to 10 MiB.
+// decodeJSON reads exactly one JSON value, rejects unknown fields and trailing
+// content, and limits bodies to 10 MiB.
 func decodeJSON(r *http.Request, value any) error {
 	r.Body = http.MaxBytesReader(nil, r.Body, 10<<20)
 	defer r.Body.Close()
@@ -80,8 +82,11 @@ func decodeJSON(r *http.Request, value any) error {
 		return err
 	}
 	var trailing any
-	if err := decoder.Decode(&trailing); err == nil {
-		return &json.SyntaxError{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
 	}
 	return nil
 }
