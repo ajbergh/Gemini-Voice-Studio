@@ -1,0 +1,2 @@
+This placeholder keeps the embedded frontend directory present for development builds.
+Production build scripts replace the directory contents with the Vite output.
