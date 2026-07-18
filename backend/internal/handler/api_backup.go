@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -77,19 +78,19 @@ func (h *BackupHandler) CreateBackup(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
 		Database:      "database/data.db",
 	}
-
-	entry, err := addBackupFile(zw, dbPath, manifest.Database)
-	if err == nil {
+	entry, packageErr := addBackupFile(zw, dbPath, manifest.Database)
+	if packageErr == nil {
 		manifest.Files = append(manifest.Files, entry)
 	}
 
-	if err == nil {
+	if packageErr == nil {
 		mediaEntries, readErr := os.ReadDir(h.AudioCacheDir)
 		if readErr != nil && !os.IsNotExist(readErr) {
-			err = readErr
+			packageErr = readErr
 		} else {
+			sort.Slice(mediaEntries, func(i, j int) bool { return mediaEntries[i].Name() < mediaEntries[j].Name() })
 			for _, media := range mediaEntries {
-				if media.IsDir() {
+				if media.IsDir() || media.Type()&os.ModeSymlink != 0 {
 					continue
 				}
 				path, ok := safeCachePath(h.AudioCacheDir, media.Name())
@@ -98,7 +99,7 @@ func (h *BackupHandler) CreateBackup(w http.ResponseWriter, r *http.Request) {
 				}
 				entry, addErr := addBackupFile(zw, path, "media/"+media.Name())
 				if addErr != nil {
-					err = addErr
+					packageErr = addErr
 					break
 				}
 				manifest.Files = append(manifest.Files, entry)
@@ -106,23 +107,23 @@ func (h *BackupHandler) CreateBackup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err == nil {
+	if packageErr == nil {
 		manifestData, marshalErr := json.MarshalIndent(manifest, "", "  ")
 		if marshalErr != nil {
-			err = marshalErr
-		} else if fw, createErr := zw.Create("manifest.json"); createErr != nil {
-			err = createErr
-		} else if _, writeErr := fw.Write(manifestData); writeErr != nil {
-			err = writeErr
+			packageErr = marshalErr
+		} else if writer, createErr := zw.Create("manifest.json"); createErr != nil {
+			packageErr = createErr
+		} else if _, writeErr := writer.Write(manifestData); writeErr != nil {
+			packageErr = writeErr
 		}
 	}
-	if closeErr := zw.Close(); err == nil {
-		err = closeErr
+	if closeErr := zw.Close(); packageErr == nil {
+		packageErr = closeErr
 	}
-	if closeErr := archiveFile.Close(); err == nil {
-		err = closeErr
+	if closeErr := archiveFile.Close(); packageErr == nil {
+		packageErr = closeErr
 	}
-	if err != nil {
+	if packageErr != nil {
 		writeError(w, http.StatusInternalServerError, "failed to package backup")
 		return
 	}
@@ -194,21 +195,38 @@ func (h *BackupHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.Store.Restore(dbPath); err != nil {
-		writeError(w, http.StatusBadRequest, "restore failed: "+err.Error())
-		return
-	}
 	if err := os.MkdirAll(h.AudioCacheDir, 0o700); err != nil {
-		writeError(w, http.StatusInternalServerError, "database restored but media directory could not be created")
+		writeError(w, http.StatusInternalServerError, "media directory could not be created")
 		return
 	}
+	// Copy and validate media before replacing the live database. This prevents a
+	// corrupt or unwritable media payload from leaving the data model half-restored.
+	stagedDestinations := make([]string, 0, len(mediaPaths))
 	for _, source := range mediaPaths {
 		destination, ok := safeCachePath(h.AudioCacheDir, filepath.Base(source))
 		if !ok {
 			continue
 		}
-		if err := copyFileAtomic(source, destination); err != nil {
-			writeError(w, http.StatusInternalServerError, "database restored but a media asset could not be restored")
+		staged := destination + ".restore-pending"
+		_ = os.Remove(staged)
+		if err := copyFileAtomic(source, staged); err != nil {
+			cleanupFiles(stagedDestinations)
+			writeError(w, http.StatusInternalServerError, "a media asset could not be staged for restore")
+			return
+		}
+		stagedDestinations = append(stagedDestinations, staged)
+	}
+
+	if err := h.Store.Restore(dbPath); err != nil {
+		cleanupFiles(stagedDestinations)
+		writeError(w, http.StatusBadRequest, "restore failed: "+err.Error())
+		return
+	}
+	for _, staged := range stagedDestinations {
+		destination := strings.TrimSuffix(staged, ".restore-pending")
+		_ = os.Remove(destination)
+		if err := os.Rename(staged, destination); err != nil {
+			writeError(w, http.StatusInternalServerError, "database restored but a media asset could not be published")
 			return
 		}
 	}
@@ -221,67 +239,67 @@ func (h *BackupHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func addBackupFile(zw *zip.Writer, sourcePath, archivePath string) (backupManifestFile, error) {
-	f, err := os.Open(sourcePath)
+	file, err := os.Open(sourcePath)
 	if err != nil {
 		return backupManifestFile{}, err
 	}
-	defer f.Close()
-	info, err := f.Stat()
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
 		return backupManifestFile{}, err
 	}
-	fw, err := zw.CreateHeader(&zip.FileHeader{Name: archivePath, Method: zip.Deflate})
+	writer, err := zw.CreateHeader(&zip.FileHeader{Name: archivePath, Method: zip.Deflate})
 	if err != nil {
 		return backupManifestFile{}, err
 	}
 	hash := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(fw, hash), f); err != nil {
+	if _, err := io.Copy(io.MultiWriter(writer, hash), file); err != nil {
 		return backupManifestFile{}, err
 	}
 	return backupManifestFile{Path: archivePath, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
 }
 
 func isZipArchive(path string) (bool, error) {
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
+	defer file.Close()
 	var header [4]byte
-	if _, err := io.ReadFull(f, header[:]); err != nil {
+	if _, err := io.ReadFull(file, header[:]); err != nil {
 		return false, err
 	}
 	return string(header[:2]) == "PK", nil
 }
 
 func extractAndValidateBackup(archivePath, stageDir string) (backupManifest, string, []string, error) {
-	zr, err := zip.OpenReader(archivePath)
+	reader, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return backupManifest{}, "", nil, err
 	}
-	defer zr.Close()
+	defer reader.Close()
 
 	var manifest backupManifest
-	var manifestFound bool
+	manifestFound := false
 	extracted := make(map[string]string)
-	for _, entry := range zr.File {
+	for _, entry := range reader.File {
 		clean := filepath.ToSlash(filepath.Clean(entry.Name))
 		if strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") || clean == "." {
 			return backupManifest{}, "", nil, fmt.Errorf("unsafe archive path %q", entry.Name)
 		}
-		if entry.FileInfo().IsDir() {
+		if entry.FileInfo().IsDir() || entry.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
 		if clean != "manifest.json" && clean != "database/data.db" && !strings.HasPrefix(clean, "media/") {
 			continue
 		}
-		rc, err := entry.Open()
+		stream, err := entry.Open()
 		if err != nil {
 			return backupManifest{}, "", nil, err
 		}
 		if clean == "manifest.json" {
-			err = json.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&manifest)
-			_ = rc.Close()
+			err = json.NewDecoder(io.LimitReader(stream, 1<<20)).Decode(&manifest)
+			_ = stream.Close()
 			if err != nil {
 				return backupManifest{}, "", nil, err
 			}
@@ -291,17 +309,22 @@ func extractAndValidateBackup(archivePath, stageDir string) (backupManifest, str
 
 		destination := filepath.Join(stageDir, filepath.FromSlash(clean))
 		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-			_ = rc.Close()
+			_ = stream.Close()
 			return backupManifest{}, "", nil, err
 		}
-		out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err == nil {
-			_, err = io.Copy(out, rc)
-		}
-		_ = out.Close()
-		_ = rc.Close()
+		output, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
+			_ = stream.Close()
 			return backupManifest{}, "", nil, err
+		}
+		_, copyErr := io.Copy(output, io.LimitReader(stream, int64(entry.UncompressedSize64)+1))
+		closeErr := output.Close()
+		_ = stream.Close()
+		if copyErr != nil {
+			return backupManifest{}, "", nil, copyErr
+		}
+		if closeErr != nil {
+			return backupManifest{}, "", nil, closeErr
 		}
 		extracted[clean] = destination
 	}
@@ -335,17 +358,18 @@ func extractAndValidateBackup(archivePath, stageDir string) (backupManifest, str
 			media = append(media, path)
 		}
 	}
+	sort.Strings(media)
 	return manifest, dbPath, media, nil
 }
 
 func fileSHA256(path string) (string, int64, error) {
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
-	defer f.Close()
+	defer file.Close()
 	hash := sha256.New()
-	size, err := io.Copy(hash, f)
+	size, err := io.Copy(hash, file)
 	if err != nil {
 		return "", 0, err
 	}
@@ -353,31 +377,41 @@ func fileSHA256(path string) (string, int64, error) {
 }
 
 func copyFileAtomic(source, destination string) error {
-	in, err := os.Open(source)
+	input, err := os.Open(source)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	tmp, err := os.CreateTemp(filepath.Dir(destination), ".restore-*")
+	defer input.Close()
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(destination), ".restore-*")
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
 		return err
 	}
-	if _, err := io.Copy(tmp, in); err != nil {
-		_ = tmp.Close()
+	if _, err := io.Copy(temporary, input); err != nil {
+		_ = temporary.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, destination)
+	_ = os.Remove(destination)
+	return os.Rename(temporaryPath, destination)
+}
+
+func cleanupFiles(paths []string) {
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
 }
