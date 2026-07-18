@@ -3,10 +3,9 @@
 
 // Package main is the entry point for the Gemini Voice Studio server.
 //
-// It parses CLI flags (--port, --db, --passphrase, --log-level, --open),
-// loads configuration with platform-aware defaults, derives the AES-256
-// encryption key, opens the SQLite database, embeds the frontend SPA,
-// and starts the HTTP server with graceful shutdown on SIGINT/SIGTERM.
+// It parses CLI flags, loads platform-aware defaults, derives the API-key
+// encryption key, opens SQLite, embeds the frontend SPA, and starts the HTTP
+// server with graceful shutdown on SIGINT/SIGTERM.
 package main
 
 import (
@@ -18,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -29,25 +29,47 @@ import (
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/store"
 )
 
+var (
+	version   = "dev"
+	commitSHA = "unknown"
+	buildDate = "unknown"
+)
+
 // main wires CLI configuration, persistent storage, frontend assets, and HTTP lifecycle.
 func main() {
-	// Parse flags
 	port := flag.Int("port", 0, "HTTP server port (default: 8080)")
+	dataDir := flag.String("data-dir", "", "Persistent application data directory")
 	dbPath := flag.String("db", "", "SQLite database path")
-	passphrase := flag.String("passphrase", "", "Encryption passphrase (uses machine ID if empty)")
+	audioDir := flag.String("audio-dir", "", "Persistent generated-audio directory")
+	passphrase := flag.String("passphrase", "", "Encryption passphrase (uses machine identity if empty)")
 	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error")
 	openBrowser := flag.Bool("open", true, "Open browser on startup")
+	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
 
-	// Load config file
-	cfg := config.DefaultConfig()
+	if *showVersion {
+		fmt.Printf("Gemini Voice Studio %s (%s, built %s)\n", version, commitSHA, buildDate)
+		return
+	}
 
-	// Override from flags
+	cfg := config.DefaultConfig()
+	if *dataDir != "" {
+		cfg.DataDir = filepath.Clean(*dataDir)
+		cfg.DBPath = filepath.Join(cfg.DataDir, "data.db")
+		cfg.AudioCacheDir = filepath.Join(cfg.DataDir, "audio")
+	}
 	if *port != 0 {
 		cfg.Port = *port
 	}
 	if *dbPath != "" {
-		cfg.DBPath = *dbPath
+		cfg.DBPath = filepath.Clean(*dbPath)
+		if *dataDir == "" && *audioDir == "" {
+			cfg.DataDir = filepath.Dir(cfg.DBPath)
+			cfg.AudioCacheDir = filepath.Join(cfg.DataDir, "audio")
+		}
+	}
+	if *audioDir != "" {
+		cfg.AudioCacheDir = filepath.Clean(*audioDir)
 	}
 	if *passphrase != "" {
 		cfg.Passphrase = *passphrase
@@ -57,7 +79,6 @@ func main() {
 	}
 	cfg.OpenBrowser = *openBrowser
 
-	// Set up structured logging
 	var level slog.Level
 	switch cfg.LogLevel {
 	case "debug":
@@ -71,20 +92,17 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	// Ensure data directory exists
 	if err := cfg.EnsureDataDir(); err != nil {
 		slog.Error("failed to create data directory", "error", err)
 		os.Exit(1)
 	}
 
-	// Derive encryption key
 	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase)
 	if err != nil {
 		slog.Error("failed to derive encryption key", "error", err)
 		os.Exit(1)
 	}
 
-	// Open database
 	st, err := store.New(cfg.DBPath)
 	if err != nil {
 		slog.Error("failed to open database", "error", err)
@@ -92,35 +110,33 @@ func main() {
 	}
 	defer st.Close()
 
-	// Get embedded frontend
 	frontendFS := fe.FrontendFS()
-
-	// Create server
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	srv := server.New(addr, st, cryptoKey, frontendFS, cfg.AudioCacheDir)
 
-	// Create HTTP server for graceful shutdown
 	httpServer := &http.Server{
-		Addr:         addr,
-		Handler:      srv.Handler(),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second, // TTS can take a while
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      0, // streaming endpoints manage their own provider timeouts
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
-	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
 		<-ctx.Done()
-		slog.Info("shutting down server...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		slog.Info("shutting down server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		httpServer.Shutdown(shutdownCtx)
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("graceful shutdown timed out", "error", err)
+		}
 	}()
 
-	// Open browser
 	url := fmt.Sprintf("http://localhost:%d", cfg.Port)
 	if cfg.OpenBrowser {
 		go func() {
@@ -129,7 +145,13 @@ func main() {
 		}()
 	}
 
-	slog.Info("starting server", "addr", url, "db", cfg.DBPath)
+	slog.Info("starting server",
+		"addr", url,
+		"db", cfg.DBPath,
+		"audio_dir", cfg.AudioCacheDir,
+		"version", version,
+		"commit", commitSHA,
+	)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
