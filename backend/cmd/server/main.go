@@ -1,11 +1,7 @@
 // Copyright 2025 ajbergh
 // SPDX-License-Identifier: Apache-2.0
 
-// Package main is the entry point for the Gemini Voice Studio server.
-//
-// It parses CLI flags, loads platform-aware defaults, derives the API-key
-// encryption key, opens SQLite, embeds the frontend SPA, and starts the HTTP
-// server with graceful shutdown on SIGINT/SIGTERM.
+// Package main is the entry point for Gemini Voice Studio.
 package main
 
 import (
@@ -22,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/buildinfo"
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/config"
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/crypto"
 	fe "github.com/ajbergh/gemini-voice-gen-tts/backend/internal/embed"
@@ -29,55 +26,76 @@ import (
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/store"
 )
 
-var (
-	version   = "dev"
-	commitSHA = "unknown"
-	buildDate = "unknown"
-)
-
-// main wires CLI configuration, persistent storage, frontend assets, and HTTP lifecycle.
 func main() {
-	port := flag.Int("port", 0, "HTTP server port (default: 8080)")
+	configPath := flag.String("config", "", "Optional JSON configuration file")
+	port := flag.Int("port", 0, "HTTP server port")
 	dataDir := flag.String("data-dir", "", "Persistent application data directory")
 	dbPath := flag.String("db", "", "SQLite database path")
 	audioDir := flag.String("audio-dir", "", "Persistent generated-audio directory")
-	passphrase := flag.String("passphrase", "", "Encryption passphrase (uses machine identity if empty)")
+	passphrase := flag.String("passphrase", "", "Encryption passphrase")
 	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error")
 	openBrowser := flag.Bool("open", true, "Open browser on startup")
 	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("Gemini Voice Studio %s (%s, built %s)\n", version, commitSHA, buildDate)
+		fmt.Printf("Gemini Voice Studio %s (%s, built %s)\n", buildinfo.Version, buildinfo.Commit, buildinfo.Date)
 		return
 	}
 
+	resolvedConfigPath := *configPath
+	if resolvedConfigPath == "" {
+		resolvedConfigPath = os.Getenv("GVS_CONFIG")
+	}
 	cfg := config.DefaultConfig()
-	if *dataDir != "" {
+	if resolvedConfigPath != "" {
+		loaded, err := config.Load(filepath.Clean(resolvedConfigPath))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+			os.Exit(2)
+		}
+		cfg = loaded
+	}
+	var err error
+	cfg, err = config.ApplyEnvironment(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "environment configuration error: %v\n", err)
+		os.Exit(2)
+	}
+
+	provided := map[string]bool{}
+	flag.Visit(func(current *flag.Flag) { provided[current.Name] = true })
+	if provided["data-dir"] {
 		cfg.DataDir = filepath.Clean(*dataDir)
 		cfg.DBPath = filepath.Join(cfg.DataDir, "data.db")
 		cfg.AudioCacheDir = filepath.Join(cfg.DataDir, "audio")
 	}
-	if *port != 0 {
+	if provided["port"] {
 		cfg.Port = *port
 	}
-	if *dbPath != "" {
+	if provided["db"] {
 		cfg.DBPath = filepath.Clean(*dbPath)
-		if *dataDir == "" && *audioDir == "" {
+		if !provided["data-dir"] && !provided["audio-dir"] {
 			cfg.DataDir = filepath.Dir(cfg.DBPath)
 			cfg.AudioCacheDir = filepath.Join(cfg.DataDir, "audio")
 		}
 	}
-	if *audioDir != "" {
+	if provided["audio-dir"] {
 		cfg.AudioCacheDir = filepath.Clean(*audioDir)
 	}
-	if *passphrase != "" {
+	if provided["passphrase"] {
 		cfg.Passphrase = *passphrase
 	}
-	if *logLevel != "" {
+	if provided["log-level"] {
 		cfg.LogLevel = *logLevel
 	}
-	cfg.OpenBrowser = *openBrowser
+	if provided["open"] {
+		cfg.OpenBrowser = *openBrowser
+	}
+	if err := config.Validate(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
+		os.Exit(2)
+	}
 
 	var level slog.Level
 	switch cfg.LogLevel {
@@ -91,7 +109,6 @@ func main() {
 		level = slog.LevelInfo
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
-
 	if err := cfg.EnsureDataDir(); err != nil {
 		slog.Error("failed to create data directory", "error", err)
 		os.Exit(1)
@@ -102,7 +119,6 @@ func main() {
 		slog.Error("failed to derive encryption key", "error", err)
 		os.Exit(1)
 	}
-
 	st, err := store.New(cfg.DBPath)
 	if err != nil {
 		slog.Error("failed to open database", "error", err)
@@ -113,20 +129,14 @@ func main() {
 	frontendFS := fe.FrontendFS()
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	srv := server.New(addr, st, cryptoKey, frontendFS, cfg.AudioCacheDir)
-
 	httpServer := &http.Server{
-		Addr:              addr,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      0, // streaming endpoints manage their own provider timeouts
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		Addr: addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout: 30 * time.Second, WriteTimeout: 0,
+		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down server")
@@ -144,13 +154,10 @@ func main() {
 			openURL(url)
 		}()
 	}
-
 	slog.Info("starting server",
-		"addr", url,
-		"db", cfg.DBPath,
-		"audio_dir", cfg.AudioCacheDir,
-		"version", version,
-		"commit", commitSHA,
+		"addr", url, "db", cfg.DBPath, "audio_dir", cfg.AudioCacheDir,
+		"version", buildinfo.Version, "commit", buildinfo.Commit,
+		"schema", st.SchemaVersion(),
 	)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server error", "error", err)
@@ -159,18 +166,17 @@ func main() {
 	slog.Info("server stopped")
 }
 
-// openURL opens a URL in the default browser.
 func openURL(url string) {
-	var cmd *exec.Cmd
+	var command *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
+		command = exec.Command("cmd", "/c", "start", url)
 	case "darwin":
-		cmd = exec.Command("open", url)
+		command = exec.Command("open", url)
 	default:
-		cmd = exec.Command("xdg-open", url)
+		command = exec.Command("xdg-open", url)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := command.Start(); err != nil {
 		slog.Warn("failed to open browser", "error", err)
 	}
 }
