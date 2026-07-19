@@ -133,8 +133,9 @@ func (h *BackupHandler) CreateBackup(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, archivePath)
 }
 
-// RestoreBackup validates and restores a portable archive. Legacy database-only
-// backup files remain supported for compatibility.
+// RestoreBackup validates and stages a portable archive. Database replacement
+// is applied atomically at the next process start, so active requests never run
+// against a database that has been swapped underneath them.
 func (h *BackupHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -171,10 +172,15 @@ func (h *BackupHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isArchive {
 		if err := h.Store.Restore(uploadPath); err != nil {
-			writeError(w, http.StatusBadRequest, "restore failed: "+err.Error())
+			writeError(w, http.StatusBadRequest, "restore validation failed: "+err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "restored", "format": "legacy_database"})
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status":           "staged",
+			"format":           "legacy_database",
+			"restart_required": true,
+			"message":          "Restore validated and staged. Restart Gemini Voice Studio to apply it.",
+		})
 		return
 	}
 
@@ -199,8 +205,6 @@ func (h *BackupHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "media directory could not be created")
 		return
 	}
-	// Copy and validate media before replacing the live database. This prevents a
-	// corrupt or unwritable media payload from leaving the data model half-restored.
 	stagedDestinations := make([]string, 0, len(mediaPaths))
 	for _, source := range mediaPaths {
 		destination, ok := safeCachePath(h.AudioCacheDir, filepath.Base(source))
@@ -219,22 +223,28 @@ func (h *BackupHandler) RestoreBackup(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.Store.Restore(dbPath); err != nil {
 		cleanupFiles(stagedDestinations)
-		writeError(w, http.StatusBadRequest, "restore failed: "+err.Error())
+		writeError(w, http.StatusBadRequest, "restore validation failed: "+err.Error())
 		return
 	}
+
+	// Publish the validated media snapshot now, while the database itself remains
+	// staged for restart. The response makes the restart boundary explicit so the
+	// UI can immediately stop mutations and prompt the user to relaunch.
 	for _, staged := range stagedDestinations {
 		destination := strings.TrimSuffix(staged, ".restore-pending")
 		_ = os.Remove(destination)
 		if err := os.Rename(staged, destination); err != nil {
-			writeError(w, http.StatusInternalServerError, "database restored but a media asset could not be published")
+			writeError(w, http.StatusInternalServerError, "database restore is staged but a media asset could not be published")
 			return
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":         "restored",
-		"format_version": manifest.FormatVersion,
-		"media_restored": len(mediaPaths),
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":           "staged",
+		"format_version":   manifest.FormatVersion,
+		"media_staged":     len(mediaPaths),
+		"restart_required": true,
+		"message":          "Restore validated and staged. Restart Gemini Voice Studio to apply the database snapshot.",
 	})
 }
 
