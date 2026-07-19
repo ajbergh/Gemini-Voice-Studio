@@ -114,7 +114,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase)
+	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase, cfg.DataDir)
 	if err != nil {
 		slog.Error("failed to derive encryption key", "error", err)
 		os.Exit(1)
