@@ -23,13 +23,13 @@ type CacheHandler struct {
 }
 
 type mediaStats struct {
-	TotalSize       int64  `json:"total_size"`
-	FileCount       int    `json:"file_count"`
-	ProtectedSize   int64  `json:"protected_size"`
-	ProtectedFiles  int    `json:"protected_files"`
-	ReclaimableSize int64  `json:"reclaimable_size"`
-	ReclaimableFiles int   `json:"reclaimable_files"`
-	CacheDir        string `json:"cache_dir"`
+	TotalSize        int64  `json:"total_size"`
+	FileCount        int    `json:"file_count"`
+	ProtectedSize    int64  `json:"protected_size"`
+	ProtectedFiles   int    `json:"protected_files"`
+	ReclaimableSize  int64  `json:"reclaimable_size"`
+	ReclaimableFiles int    `json:"reclaimable_files"`
+	CacheDir         string `json:"cache_dir"`
 }
 
 // GetCacheStats reports durable/referenced and reclaimable media separately.
@@ -39,7 +39,6 @@ func (h *CacheHandler) GetCacheStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to inspect referenced media")
 		return
 	}
-
 	stats := mediaStats{CacheDir: h.AudioCacheDir}
 	entries, err := os.ReadDir(h.AudioCacheDir)
 	if err != nil {
@@ -50,7 +49,6 @@ func (h *CacheHandler) GetCacheStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to inspect media directory")
 		return
 	}
-
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -69,19 +67,17 @@ func (h *CacheHandler) GetCacheStats(w http.ResponseWriter, r *http.Request) {
 			stats.ReclaimableFiles++
 		}
 	}
-
 	writeJSON(w, http.StatusOK, stats)
 }
 
 // ClearCache removes only unreferenced files. Project takes, history audio,
-// preset samples, and generated preset artwork remain intact.
+// preset samples, generated artwork, and encryption metadata remain intact.
 func (h *CacheHandler) ClearCache(w http.ResponseWriter, r *http.Request) {
 	referenced, err := h.referencedFiles()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to inspect referenced media")
 		return
 	}
-
 	entries, err := os.ReadDir(h.AudioCacheDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -91,7 +87,6 @@ func (h *CacheHandler) ClearCache(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to inspect media directory")
 		return
 	}
-
 	removed := 0
 	protected := 0
 	for _, entry := range entries {
@@ -110,23 +105,20 @@ func (h *CacheHandler) ClearCache(w http.ResponseWriter, r *http.Request) {
 			removed++
 		}
 	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":    "cleared",
-		"removed":   removed,
-		"protected": protected,
+		"status": "cleared", "removed": removed, "protected": protected,
 	})
 }
 
-// referencedFiles returns basenames for every media file currently referenced
-// by a database record. Paths are normalized to basenames because all handlers
-// validate reads against AudioCacheDir before opening a file.
+// referencedFiles returns basenames for every durable media file.
 func (h *CacheHandler) referencedFiles() (map[string]bool, error) {
-	refs := make(map[string]bool)
+	refs := map[string]bool{
+		"encryption.salt":                 true,
+		"encryption.salt.restore-pending": true,
+	}
 	if h.Store == nil {
 		return refs, nil
 	}
-
 	rows, err := h.Store.DB().Query(`
 		SELECT audio_path FROM history WHERE audio_path IS NOT NULL AND audio_path <> ''
 		UNION ALL
@@ -140,7 +132,7 @@ func (h *CacheHandler) referencedFiles() (map[string]bool, error) {
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, err
 		}
 		if name := filepath.Base(strings.TrimSpace(path)); name != "" && name != "." {
@@ -148,12 +140,11 @@ func (h *CacheHandler) referencedFiles() (map[string]bool, error) {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return nil, err
 	}
-	rows.Close()
+	_ = rows.Close()
 
-	// Preset artwork paths are stored inside metadata_json.
 	metaRows, err := h.Store.DB().Query(`SELECT metadata_json FROM custom_presets WHERE metadata_json IS NOT NULL AND metadata_json <> ''`)
 	if err != nil {
 		return nil, err
