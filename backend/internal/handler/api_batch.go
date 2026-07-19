@@ -55,7 +55,6 @@ type batchRenderResponse struct {
 }
 
 type renderTask struct {
-	index          int
 	segment        store.ScriptSegment
 	originalStatus string
 }
@@ -230,31 +229,20 @@ func (h *BatchHandler) runBatchRender(ctx context.Context, jobID string, project
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for {
-				select {
-				case <-ctx.Done():
+			for task := range tasks {
+				if ctx.Err() != nil {
 					return
-				case task, ok := <-tasks:
-					if !ok {
-						return
-					}
-					_ = h.Store.UpdateSegmentStatus(projectID, task.segment.ID, "rendering")
-					err := h.renderOneSegment(ctx, projectID, project, task.segment)
-					select {
-					case results <- renderResult{task: task, err: err}:
-					case <-ctx.Done():
-						if err != nil {
-							_ = h.Store.UpdateSegmentStatus(projectID, task.segment.ID, task.originalStatus)
-						}
-						return
-					}
 				}
+				_ = h.Store.UpdateSegmentStatus(projectID, task.segment.ID, "rendering")
+				err := h.renderOneSegment(ctx, projectID, project, task.segment)
+				results <- renderResult{task: task, err: err}
+			}
 		}()
 	}
 	go func() {
 		defer close(tasks)
-		for index, segment := range segments {
-			task := renderTask{index: index, segment: segment, originalStatus: segment.Status}
+		for _, segment := range segments {
+			task := renderTask{segment: segment, originalStatus: segment.Status}
 			select {
 			case tasks <- task:
 			case <-ctx.Done():
@@ -285,11 +273,6 @@ func (h *BatchHandler) runBatchRender(ctx context.Context, jobID string, project
 	}
 
 	if ctx.Err() != nil {
-		for _, segment := range segments {
-			if segment.Status == "rendering" {
-				_ = h.Store.UpdateSegmentStatus(projectID, segment.ID, segment.Status)
-			}
-		}
 		emit("cancelled", fmt.Sprintf("Cancelled after %d/%d segments", processed, total), processed, completed, failed, 0)
 		return
 	}
@@ -534,7 +517,9 @@ func (h *BatchHandler) renderOneSegment(ctx context.Context, projectID int64, pr
 		}
 	}
 	if err := h.Store.UpdateSegmentStatus(projectID, segment.ID, "rendered"); err != nil {
-		return fmt.Errorf("segment %d: update rendered status: %w", segment.ID, err)
+		// The take and audio are already durable. Do not report the provider render
+		// as failed or delete the asset; surface the metadata repair need in logs.
+		slog.Error("render persisted but segment status update failed", "segment_id", segment.ID, "take_id", takeID, "error", err)
 	}
 	return nil
 }
