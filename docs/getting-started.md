@@ -1,110 +1,94 @@
 # Getting Started
 
-This guide walks you through installing, configuring, and running Gemini Voice Studio for the first time.
-
-![Gemini Voice Studio main interface showing the Voice Library 3D carousel in dark mode](../assets/screenshots/01-voice-library-grid-dark.png)
-*Gemini Voice Studio — browse 30 curated Gemini TTS voices, generate speech, and manage full production projects from a single interface*
-
----
+This guide covers development setup, production builds, runtime configuration, data storage, and portable backup/restore for Gemini Voice Studio.
 
 ## Prerequisites
 
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| Node.js | 18+ | For the frontend dev server and build tools |
-| Go | 1.22+ | For the backend server |
-| Gemini API Key | — | Free tier available at [Google AI Studio](https://aistudio.google.com/) |
+| Requirement | Supported version | Purpose |
+|---|---:|---|
+| Node.js | 22+ | Frontend development and production asset builds |
+| Go | 1.25+ | Backend and single-binary builds |
+| Gemini API key | Current Google AI Studio key | Casting, script preparation, TTS, and portrait generation |
 
----
-
-## Installation
-
-### 1. Clone the Repository
+## Clone and install
 
 ```bash
-git clone https://github.com/ajbergh/Gemini-Voice-Gen-TTS.git
-cd Gemini-Voice-Gen-TTS
+git clone https://github.com/ajbergh/Gemini-Voice-Studio.git
+cd Gemini-Voice-Studio
+npm ci
 ```
 
-### 2. Install Frontend Dependencies
+`npm ci` is used instead of `npm install` so local builds match CI and the committed lockfile.
 
-```bash
-npm install
-```
+## Development mode
 
----
+Development uses two processes. Vite serves the frontend and proxies API/WebSocket traffic to the Go backend.
 
-## Running in Development Mode
-
-Development mode runs the frontend and backend as two separate processes, with the Vite dev server proxying `/api` calls to the Go backend.
-
-**Terminal 1 — Start the Go backend:**
+**Terminal 1 — backend**
 
 ```bash
 cd backend
-go run ./cmd/server
+go run ./cmd/server --open=false
 ```
 
-The backend listens on `http://localhost:8080`. On first run it creates a SQLite database in your platform's app data directory.
+Windows users can alternatively run:
 
-**Windows shortcut:**
 ```powershell
 .\scripts\start-backend-dev.ps1
 ```
 
-**Terminal 2 — Start the frontend dev server:**
+**Terminal 2 — frontend**
 
 ```bash
 npm run dev
 ```
 
-The frontend runs at **[http://localhost:4000](http://localhost:4000)**.
+Open **http://localhost:3000**. The backend listens on `127.0.0.1:8080` by default. Vite proxies `/api/` and `/api/ws` to that backend.
 
----
+The tracked `backend/internal/embed/dist/.gitkeep` file allows a clean checkout to compile without first building the frontend. Development traffic is still served by Vite; production builds replace the placeholder with the generated `dist` files.
 
-## First Launch
+## Configure a Gemini API key
 
-1. Open [http://localhost:4000](http://localhost:4000) in your browser.
-2. The **Onboarding Tour** starts automatically on first launch — follow the walkthrough to get oriented.
-3. Click **Settings** (gear icon in the left sidebar) to open the API key setup.
+1. Open **Settings**.
+2. Enter a Gemini API key.
+3. Use **Test Key**.
+4. Save the key.
 
----
+Gemini requests are made by the Go backend, not by the browser. New credentials are encrypted with a versioned PBKDF2-HMAC-SHA256 + AES-256-GCM envelope. Existing credentials encrypted by earlier releases remain readable.
 
-## Configuring Your API Key
+For portable credentials, start the app with an explicit passphrase through `--passphrase`, `GVS_PASSPHRASE`, or the JSON config file. When no passphrase is supplied, the fallback remains machine-derived and is therefore intentionally tied to that user/machine identity.
 
-The app never calls Gemini directly from the browser. All AI calls go through the Go backend, which stores your key encrypted at rest using AES-256-GCM.
+### Key pools
 
-1. In the **Settings** modal, paste your Gemini API key.
-2. Click **Test Key** to validate it against the Gemini API.
-3. Click **Save** — the key is encrypted and stored in the local SQLite database.
+Multiple Gemini keys can be added to a pool. The backend leases healthy keys transactionally, rotates by least-recently-used order, and supports cooldown/error health metadata. The primary key remains the fallback when the pool contains no eligible key.
 
-![Settings modal with API key input and Save Key button](../assets/screenshots/13-settings-dark.png)
-*Open Settings from the gear icon in the sidebar — keys are encrypted with AES-256-GCM before storage*
+## Validate before building
 
-> **Get a free key:** Visit [Google AI Studio](https://aistudio.google.com/apikey) → Create API Key. The free tier includes access to Gemini 3.1 Flash TTS.
-
-### Key Pools (Optional)
-
-For high-volume use, you can add multiple API keys to a pool. The backend automatically rotates across them to stay within rate limits.
-
-1. Open **Settings → API Keys**.
-2. Click **Add to Pool** and paste an additional key.
-3. Repeat for as many keys as you have.
-
----
-
-## Production Build (Single Binary)
-
-Build a self-contained executable with the frontend embedded — no Node.js or npm required on the target machine.
-
-**Windows:**
-```powershell
-.\scripts\build-windows.ps1
-.\scripts\build-windows.ps1 -Arch arm64    # ARM64
-.\scripts\build-windows.ps1 -Clean         # Clean before build
+```bash
+npm run typecheck
+npm run build
+cd backend
+go vet ./...
+go test ./...
+go test -race ./...
 ```
 
-**Linux:**
+The pull-request CI workflow runs the same validation plus Playwright and Docker builds.
+
+## Production single-binary builds
+
+Platform scripts build the frontend, embed it in the Go binary, and inject version metadata.
+
+### Windows
+
+```powershell
+.\scripts\build-windows.ps1
+.\scripts\build-windows.ps1 -Arch arm64
+.\scripts\build-windows.ps1 -Clean
+```
+
+### Linux
+
 ```bash
 chmod +x scripts/build-linux.sh
 ./scripts/build-linux.sh
@@ -112,98 +96,144 @@ chmod +x scripts/build-linux.sh
 ./scripts/build-linux.sh --clean
 ```
 
-**macOS:**
+### macOS
+
 ```bash
 chmod +x scripts/build-macos.sh
-./scripts/build-macos.sh                   # ARM64 (Apple Silicon)
-./scripts/build-macos.sh --arch amd64      # Intel
-./scripts/build-macos.sh --universal       # Universal binary
+./scripts/build-macos.sh
+./scripts/build-macos.sh --arch amd64
+./scripts/build-macos.sh --universal
 ./scripts/build-macos.sh --clean
 ```
 
-Binaries are output to `bin/`. Run it:
+Artifacts are named consistently, for example:
 
 ```bash
-./bin/gemini-voice-library-linux-amd64 --port 8080 --open
+./bin/gemini-voice-studio-linux-amd64 --version
+./bin/gemini-voice-studio-linux-amd64 --open=true
 ```
 
-The `--open` flag automatically opens your browser.
+Set `VERSION`, `COMMIT_SHA`, and `BUILD_DATE` before invoking a script to override embedded build metadata. Tag-driven GitHub releases set these values automatically.
 
-### CLI Flags
+## Runtime configuration
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port` | `8080` | HTTP server port |
-| `--db` | `<platform data dir>/gemini-voice-gen-tts/data.db` | SQLite database path |
-| `--passphrase` | *(machine-derived)* | Encryption passphrase for API keys |
-| `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `--open` | `false` | Open browser automatically on start |
+Resolution order is:
 
----
+1. Compiled platform defaults
+2. JSON configuration file
+3. `GVS_*` environment variables
+4. Explicit CLI flags
+
+Later sources override earlier sources.
+
+### CLI flags
+
+| Flag | Description |
+|---|---|
+| `--config` | Optional JSON configuration file |
+| `--port` | HTTP port, default `8080` |
+| `--data-dir` | Persistent application data directory |
+| `--db` | Explicit SQLite database path |
+| `--audio-dir` | Durable generated-media directory |
+| `--passphrase` | Credential-encryption passphrase |
+| `--log-level` | `debug`, `info`, `warn`, or `error` |
+| `--open` | Open the browser on startup |
+| `--version` | Print build version, commit, and date |
+
+### Environment variables
+
+| Variable | Equivalent setting |
+|---|---|
+| `GVS_CONFIG` | `--config` |
+| `GVS_PORT` | `--port` |
+| `GVS_DATA_DIR` | `--data-dir` |
+| `GVS_DB_PATH` | `--db` |
+| `GVS_AUDIO_DIR` | `--audio-dir` |
+| `GVS_PASSPHRASE` | `--passphrase` |
+| `GVS_LOG_LEVEL` | `--log-level` |
+| `GVS_OPEN_BROWSER` | `--open` |
+
+Example:
+
+```bash
+GVS_DATA_DIR=/srv/gemini-voice-studio \
+GVS_PASSPHRASE='use-a-secret-manager-in-production' \
+./gemini-voice-studio-linux-amd64 --open=false
+```
 
 ## Docker
 
-A `Dockerfile` and `docker-compose.yml` are included for containerized deployment.
+```bash
+docker build -t gemini-voice-studio .
+docker run --rm \
+  -p 8080:8080 \
+  -v "$PWD/data:/home/app/data" \
+  gemini-voice-studio
+```
+
+The image runs as a non-root user, exposes a health check at `/api/health`, and persists the database, generated media, encryption salt, and export workspace beneath `/home/app/data`.
+
+## Data storage
+
+The application maintains several classes of local state:
+
+- SQLite database and migration ledger
+- Encrypted API keys and key-pool health
+- Project takes, TTS history audio, preset samples, and portrait artwork
+- Temporary/reclaimable generated files
+- Export ZIPs
+- Installation encryption salt
+
+Generated project media is durable. **Clear cache** removes only files that are not referenced by database records and never deletes the encryption salt.
+
+SQLite runs in WAL mode with foreign keys enabled and a deterministic single-connection policy. Migrations are transactional and recorded in `schema_migrations`.
+
+## Portable backup and restore
+
+Settings → Backup creates a `.gvsbackup` archive containing:
+
+- A consistent SQLite snapshot
+- Durable generated media and artwork
+- The installation encryption salt
+- A versioned manifest
+- File sizes and SHA-256 checksums
+
+Command-line example:
 
 ```bash
-docker compose up --build
+curl -X POST http://localhost:8080/api/backup \
+  --output gemini-voice-studio.gvsbackup
 ```
 
-The app will be available at `http://localhost:8080`. Mount a volume to persist the database:
-
-```yaml
-volumes:
-  - ./data:/root/.local/share/gemini-voice-gen-tts
-```
-
----
-
-## Data Storage
-
-All application data is stored in a local SQLite database:
-
-| Platform | Default Path |
-|----------|-------------|
-| Windows | `%APPDATA%\gemini-voice-gen-tts\data.db` |
-| macOS | `~/Library/Application Support/gemini-voice-gen-tts/data.db` |
-| Linux | `~/.local/share/gemini-voice-gen-tts/data.db` |
-
-You can override the path with `--db /path/to/your.db`.
-
-Stored data includes:
-- Encrypted API keys and key pool entries
-- Voice library with favorites
-- Generation history and cached audio files
-- Custom voice presets and their version history
-- Script projects, sections, segments, and takes
-- Cast profiles, pronunciation dictionaries, performance styles
-- QC issues, export profiles, background job history
-- App configuration and render defaults
-
----
-
-## Backup and Restore
-
-To back up all data, use the API or the **Settings → Backup** button in the UI:
+Restore uses multipart form data:
 
 ```bash
-curl -X POST http://localhost:8080/api/backup -o backup.json
+curl -X POST http://localhost:8080/api/restore \
+  -F "backup=@gemini-voice-studio.gvsbackup"
 ```
 
-To restore:
+The restore endpoint validates paths, schema compatibility, sizes, and checksums. It returns HTTP `202 Accepted` with `restart_required: true`. Restart the application immediately after a successful restore response; the database snapshot is applied atomically at process startup rather than swapped beneath active jobs and requests.
 
-```bash
-curl -X POST http://localhost:8080/api/restore -d @backup.json
-```
+Legacy database-only backups are accepted, but they cannot restore media files or installation salt that were not present in the old format.
 
----
+## Release builds
 
-## Next Steps
+Pushing a `v*` tag runs the release workflow and produces:
 
-| Guide | Description |
-|-------|-------------|
-| [Voice Studio](voice-library.md) | Browse and preview voices |
-| [Script Reader](script-reader.md) | Generate speech from scripts |
-| [Projects](projects.md) | Production workflow for multi-segment audio |
-| [Cast Bible](cast-bible.md) | Manage character voice profiles |
-| [Settings & Administration](settings-administration.md) | API keys, cache, QC rules |
+- Linux AMD64
+- Windows AMD64
+- macOS AMD64
+- macOS ARM64
+- `SHA256SUMS.txt`
+
+Apple notarization and Windows Authenticode signing require external signing credentials and are not enabled until those secrets are provisioned.
+
+## Next steps
+
+- [Voice Studio](voice-library.md)
+- [Script Reader](script-reader.md)
+- [Projects](projects.md)
+- [Cast Bible](cast-bible.md)
+- [Review & Export](review-export.md)
+- [Settings & Administration](settings-administration.md)
+- [Remediation Status](remediation-status.md)
