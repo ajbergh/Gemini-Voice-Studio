@@ -66,7 +66,7 @@ func (h *VoicesHandler) Recommend(w http.ResponseWriter, r *http.Request) {
 	h.emitVoiceProgress(jobID, "recommend", "complete", "Voice matches ready", 100)
 
 	resultJSON, _ := json.Marshal(result)
-	if err := h.Store.InsertHistory(store.HistoryEntry{
+	if _, err := h.Store.InsertHistory(store.HistoryEntry{
 		Type: "recommendation", InputText: request.Query, ResultJSON: strPtr(string(resultJSON)),
 	}); err != nil {
 		slog.Warn("failed to persist recommendation history", "error", err)
@@ -116,7 +116,7 @@ func (h *VoicesHandler) GenerateTTS(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("failed to persist generated TTS audio", "error", persistErr)
 	}
 	voiceName := request.VoiceName
-	if err := h.Store.InsertHistory(store.HistoryEntry{
+	if _, err := h.Store.InsertHistory(store.HistoryEntry{
 		Type: "tts", VoiceName: &voiceName, InputText: request.Text, AudioPath: audioPath,
 	}); err != nil {
 		slog.Warn("failed to persist TTS history", "error", err)
@@ -172,7 +172,7 @@ func (h *VoicesHandler) GenerateMultiSpeakerTTS(w http.ResponseWriter, r *http.R
 	if persistErr != nil {
 		slog.Warn("failed to persist dialogue audio", "error", persistErr)
 	}
-	if err := h.Store.InsertHistory(store.HistoryEntry{Type: "tts_multi", InputText: request.Text, AudioPath: audioPath}); err != nil {
+	if _, err := h.Store.InsertHistory(store.HistoryEntry{Type: "tts_multi", InputText: request.Text, AudioPath: audioPath}); err != nil {
 		slog.Warn("failed to persist dialogue history", "error", err)
 	}
 	writeJSON(w, http.StatusOK, gemini.TTSResponse{AudioBase64: audioBase64})
