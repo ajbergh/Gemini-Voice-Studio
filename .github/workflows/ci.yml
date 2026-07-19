@@ -48,9 +48,37 @@ jobs:
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
-      - run: go vet ./...
-      - run: go test ./...
-      - run: go test -race ./...
+      - name: Go vet
+        shell: bash
+        run: |
+          set +e
+          mkdir -p ../output/backend
+          go vet ./... > ../output/backend/vet.log 2>&1
+          status=$?
+          cat ../output/backend/vet.log
+          exit $status
+      - name: Go tests
+        shell: bash
+        run: |
+          set +e
+          go test ./... > ../output/backend/test.log 2>&1
+          status=$?
+          cat ../output/backend/test.log
+          exit $status
+      - name: Race tests
+        shell: bash
+        run: |
+          set +e
+          go test -race ./... > ../output/backend/race.log 2>&1
+          status=$?
+          cat ../output/backend/race.log
+          exit $status
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-diagnostics
+          path: output/backend/
+          if-no-files-found: ignore
 
   container:
     name: Container build
