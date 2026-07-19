@@ -114,7 +114,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase, cfg.DataDir)
+	// The installation salt is stored beside durable generated media so portable
+	// backups capture both encrypted rows and the KDF metadata required to unlock them.
+	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase, cfg.AudioCacheDir)
 	if err != nil {
 		slog.Error("failed to derive encryption key", "error", err)
 		os.Exit(1)
