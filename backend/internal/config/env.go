@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,9 @@ import (
 
 // ApplyEnvironment applies GVS_* environment variables over file/default config.
 func ApplyEnvironment(cfg Config) (Config, error) {
+	if value := strings.TrimSpace(os.Getenv("GVS_HOST")); value != "" {
+		cfg.Host = value
+	}
 	if value := strings.TrimSpace(os.Getenv("GVS_PORT")); value != "" {
 		port, err := strconv.Atoi(value)
 		if err != nil || port < 1 || port > 65535 {
@@ -54,6 +58,19 @@ func ApplyEnvironment(cfg Config) (Config, error) {
 
 // Validate checks the resolved runtime configuration.
 func Validate(cfg Config) error {
+	if strings.TrimSpace(cfg.Host) == "" {
+		return fmt.Errorf("host is required")
+	}
+	if strings.ContainsAny(cfg.Host, " /\\") {
+		return fmt.Errorf("host must be an IP address or hostname")
+	}
+	if ip := net.ParseIP(cfg.Host); ip == nil && cfg.Host != "localhost" {
+		for _, label := range strings.Split(cfg.Host, ".") {
+			if label == "" {
+				return fmt.Errorf("host must be an IP address or hostname")
+			}
+		}
+	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return fmt.Errorf("port must be between 1 and 65535")
 	}
