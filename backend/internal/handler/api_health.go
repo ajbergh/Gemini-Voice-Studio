@@ -2,64 +2,110 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package handler implements shared HTTP helpers and endpoint handlers.
-//
-// api_health.go defines the health endpoint plus common JSON, error, decode,
-// filename, and cache-path helpers reused by the other handler files.
 package handler
 
 import (
+	"errors"
 	"encoding/json"
+	"io"
 	"net/http"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/buildinfo"
 )
 
-// Health returns server status.
+// Health returns stable liveness and release metadata without exposing secrets.
 func Health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":     "ok",
+		"version":    buildinfo.Version,
+		"commit":     buildinfo.Commit,
+		"build_date": buildinfo.Date,
+	})
 }
 
-// writeJSON encodes v as JSON and writes it to the response.
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
-// writeError writes a JSON error response.
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+// writeError keeps the historical string `error` field while adding a stable
+// machine-readable code and retry hint for typed frontend handling.
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{
+		"error":      message,
+		"code":       errorCodeForStatus(status),
+		"retryable":  status == http.StatusTooManyRequests || status >= 500,
+		"http_status": status,
+	})
 }
 
-// decodeJSON reads and decodes JSON from the request body into v.
-// Limits the body to 10 MB to prevent denial-of-service via large payloads.
-func decodeJSON(r *http.Request, v any) error {
-	r.Body = http.MaxBytesReader(nil, r.Body, 10<<20) // 10 MB
+func errorCodeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_REQUEST"
+	case http.StatusUnauthorized:
+		return "UNAUTHORIZED"
+	case http.StatusForbidden:
+		return "FORBIDDEN"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "CONFLICT"
+	case http.StatusPreconditionFailed:
+		return "PRECONDITION_FAILED"
+	case http.StatusUnprocessableEntity:
+		return "UNPROCESSABLE_ENTITY"
+	case http.StatusTooManyRequests:
+		return "RATE_LIMITED"
+	case http.StatusBadGateway:
+		return "UPSTREAM_FAILURE"
+	default:
+		if status >= 500 {
+			return "INTERNAL_ERROR"
+		}
+		return "REQUEST_FAILED"
+	}
+}
+
+// decodeJSON reads exactly one JSON value, rejects unknown fields and trailing
+// content, and limits bodies to 10 MiB.
+func decodeJSON(r *http.Request, value any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, 10<<20)
 	defer r.Body.Close()
-	return json.NewDecoder(r.Body).Decode(v)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain exactly one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
-// safeFilenameRe matches only safe characters for filenames.
 var safeFilenameRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
-// sanitizeForFilename strips path separators, dots, and special characters
-// from a user-supplied string so it is safe to use in a filename.
-func sanitizeForFilename(s string) string {
-	s = filepath.Base(s)
-	s = strings.ReplaceAll(s, "..", "")
-	s = safeFilenameRe.ReplaceAllString(s, "_")
-	if s == "" || s == "." {
-		s = "unknown"
+func sanitizeForFilename(value string) string {
+	value = filepath.Base(value)
+	value = strings.ReplaceAll(value, "..", "")
+	value = safeFilenameRe.ReplaceAllString(value, "_")
+	if value == "" || value == "." {
+		value = "unknown"
 	}
-	return s
+	return value
 }
 
-// safeCachePath builds a file path within cacheDir and validates the result
-// hasn't escaped via path traversal.
 func safeCachePath(cacheDir, filename string) (string, bool) {
-	p := filepath.Join(cacheDir, filename)
-	clean := filepath.Clean(p)
+	path := filepath.Join(cacheDir, filename)
+	clean := filepath.Clean(path)
 	if !strings.HasPrefix(clean, filepath.Clean(cacheDir)+string(filepath.Separator)) {
 		return "", false
 	}

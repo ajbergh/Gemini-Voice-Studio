@@ -1,12 +1,7 @@
 // Copyright 2025 ajbergh
 // SPDX-License-Identifier: Apache-2.0
 
-// Package main is the entry point for the Gemini Voice Studio server.
-//
-// It parses CLI flags (--port, --db, --passphrase, --log-level, --open),
-// loads configuration with platform-aware defaults, derives the AES-256
-// encryption key, opens the SQLite database, embeds the frontend SPA,
-// and starts the HTTP server with graceful shutdown on SIGINT/SIGTERM.
+// Package main is the entry point for Gemini Voice Studio.
 package main
 
 import (
@@ -14,14 +9,17 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
 
+	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/buildinfo"
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/config"
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/crypto"
 	fe "github.com/ajbergh/gemini-voice-gen-tts/backend/internal/embed"
@@ -29,35 +27,81 @@ import (
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/store"
 )
 
-// main wires CLI configuration, persistent storage, frontend assets, and HTTP lifecycle.
 func main() {
-	// Parse flags
-	port := flag.Int("port", 0, "HTTP server port (default: 8080)")
+	configPath := flag.String("config", "", "Optional JSON configuration file")
+	host := flag.String("host", "", "HTTP server bind host")
+	port := flag.Int("port", 0, "HTTP server port")
+	dataDir := flag.String("data-dir", "", "Persistent application data directory")
 	dbPath := flag.String("db", "", "SQLite database path")
-	passphrase := flag.String("passphrase", "", "Encryption passphrase (uses machine ID if empty)")
+	audioDir := flag.String("audio-dir", "", "Persistent generated-audio directory")
+	passphrase := flag.String("passphrase", "", "Encryption passphrase")
 	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error")
 	openBrowser := flag.Bool("open", true, "Open browser on startup")
+	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
 
-	// Load config file
-	cfg := config.DefaultConfig()
+	if *showVersion {
+		fmt.Printf("Gemini Voice Studio %s (%s, built %s)\n", buildinfo.Version, buildinfo.Commit, buildinfo.Date)
+		return
+	}
 
-	// Override from flags
-	if *port != 0 {
+	resolvedConfigPath := *configPath
+	if resolvedConfigPath == "" {
+		resolvedConfigPath = os.Getenv("GVS_CONFIG")
+	}
+	cfg := config.DefaultConfig()
+	if resolvedConfigPath != "" {
+		loaded, err := config.Load(filepath.Clean(resolvedConfigPath))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+			os.Exit(2)
+		}
+		cfg = loaded
+	}
+	var err error
+	cfg, err = config.ApplyEnvironment(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "environment configuration error: %v\n", err)
+		os.Exit(2)
+	}
+
+	provided := map[string]bool{}
+	flag.Visit(func(current *flag.Flag) { provided[current.Name] = true })
+	if provided["host"] {
+		cfg.Host = *host
+	}
+	if provided["data-dir"] {
+		cfg.DataDir = filepath.Clean(*dataDir)
+		cfg.DBPath = filepath.Join(cfg.DataDir, "data.db")
+		cfg.AudioCacheDir = filepath.Join(cfg.DataDir, "audio")
+	}
+	if provided["port"] {
 		cfg.Port = *port
 	}
-	if *dbPath != "" {
-		cfg.DBPath = *dbPath
+	if provided["db"] {
+		cfg.DBPath = filepath.Clean(*dbPath)
+		if !provided["data-dir"] && !provided["audio-dir"] {
+			cfg.DataDir = filepath.Dir(cfg.DBPath)
+			cfg.AudioCacheDir = filepath.Join(cfg.DataDir, "audio")
+		}
 	}
-	if *passphrase != "" {
+	if provided["audio-dir"] {
+		cfg.AudioCacheDir = filepath.Clean(*audioDir)
+	}
+	if provided["passphrase"] {
 		cfg.Passphrase = *passphrase
 	}
-	if *logLevel != "" {
+	if provided["log-level"] {
 		cfg.LogLevel = *logLevel
 	}
-	cfg.OpenBrowser = *openBrowser
+	if provided["open"] {
+		cfg.OpenBrowser = *openBrowser
+	}
+	if err := config.Validate(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
+		os.Exit(2)
+	}
 
-	// Set up structured logging
 	var level slog.Level
 	switch cfg.LogLevel {
 	case "debug":
@@ -70,21 +114,18 @@ func main() {
 		level = slog.LevelInfo
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
-
-	// Ensure data directory exists
 	if err := cfg.EnsureDataDir(); err != nil {
 		slog.Error("failed to create data directory", "error", err)
 		os.Exit(1)
 	}
 
-	// Derive encryption key
-	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase)
+	// The installation salt is stored beside durable generated media so portable
+	// backups capture both encrypted rows and the KDF metadata required to unlock them.
+	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase, cfg.AudioCacheDir)
 	if err != nil {
 		slog.Error("failed to derive encryption key", "error", err)
 		os.Exit(1)
 	}
-
-	// Open database
 	st, err := store.New(cfg.DBPath)
 	if err != nil {
 		slog.Error("failed to open database", "error", err)
@@ -92,44 +133,43 @@ func main() {
 	}
 	defer st.Close()
 
-	// Get embedded frontend
 	frontendFS := fe.FrontendFS()
-
-	// Create server
-	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	srv := server.New(addr, st, cryptoKey, frontendFS, cfg.AudioCacheDir)
-
-	// Create HTTP server for graceful shutdown
 	httpServer := &http.Server{
-		Addr:         addr,
-		Handler:      srv.Handler(),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second, // TTS can take a while
-		IdleTimeout:  60 * time.Second,
+		Addr: addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout: 30 * time.Second, WriteTimeout: 0,
+		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
 	}
 
-	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
 	go func() {
 		<-ctx.Done()
-		slog.Info("shutting down server...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		slog.Info("shutting down server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		httpServer.Shutdown(shutdownCtx)
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("graceful shutdown timed out", "error", err)
+		}
 	}()
 
-	// Open browser
-	url := fmt.Sprintf("http://localhost:%d", cfg.Port)
+	browserHost := cfg.Host
+	if browserHost == "0.0.0.0" || browserHost == "::" {
+		browserHost = "localhost"
+	}
+	url := fmt.Sprintf("http://%s", net.JoinHostPort(browserHost, fmt.Sprintf("%d", cfg.Port)))
 	if cfg.OpenBrowser {
 		go func() {
 			time.Sleep(500 * time.Millisecond)
 			openURL(url)
 		}()
 	}
-
-	slog.Info("starting server", "addr", url, "db", cfg.DBPath)
+	slog.Info("starting server",
+		"addr", addr, "url", url, "db", cfg.DBPath, "audio_dir", cfg.AudioCacheDir,
+		"version", buildinfo.Version, "commit", buildinfo.Commit,
+		"schema", st.SchemaVersion(),
+	)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
@@ -137,18 +177,17 @@ func main() {
 	slog.Info("server stopped")
 }
 
-// openURL opens a URL in the default browser.
 func openURL(url string) {
-	var cmd *exec.Cmd
+	var command *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
+		command = exec.Command("cmd", "/c", "start", url)
 	case "darwin":
-		cmd = exec.Command("open", url)
+		command = exec.Command("open", url)
 	default:
-		cmd = exec.Command("xdg-open", url)
+		command = exec.Command("xdg-open", url)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := command.Start(); err != nil {
 		slog.Warn("failed to open browser", "error", err)
 	}
 }

@@ -2,22 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package store provides the SQLite-backed persistence layer.
-//
-// It manages schema migrations, WAL journaling, compatibility checks, and
-// typed CRUD methods for config, API keys, history, presets, script projects,
-// takes, pronunciation, cast profiles, clients, QC, provider mappings, export
-// profiles, export jobs, and AI script-prep jobs.
 package store
 
 import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -25,140 +22,186 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+const pendingRestoreSuffix = ".restore-pending"
+
 // Store wraps a SQLite database connection.
 type Store struct {
 	db     *sql.DB
 	dbPath string
 }
 
-// New opens the SQLite database at the given path and runs migrations.
+// New applies any previously staged restore, opens SQLite, and prepares schema.
 func New(dbPath string) (*Store, error) {
-	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
-
+	if err := applyPendingRestore(dbPath); err != nil {
+		return nil, fmt.Errorf("apply pending restore: %w", err)
+	}
 	db, err := openDatabase(dbPath)
 	if err != nil {
 		return nil, err
 	}
-
-	s := &Store{db: db, dbPath: dbPath}
-	if err := s.prepareDatabase(); err != nil {
-		db.Close()
+	store := &Store{db: db, dbPath: dbPath}
+	if err := store.prepareDatabase(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-
-	return s, nil
+	return store, nil
 }
 
 // Close closes the underlying database connection.
-func (s *Store) Close() error {
-	return s.db.Close()
-}
+func (s *Store) Close() error { return s.db.Close() }
 
 // DBPath returns the path to the SQLite database file.
-func (s *Store) DBPath() string {
-	return s.dbPath
-}
+func (s *Store) DBPath() string { return s.dbPath }
 
-// Backup creates a consistent backup of the database using VACUUM INTO.
+// DB returns the underlying sql.DB for handlers that need read-only catalogue queries.
+func (s *Store) DB() *sql.DB { return s.db }
+
+// Backup creates a consistent snapshot using VACUUM INTO.
 func (s *Store) Backup(destPath string) error {
-	// Ensure destination directory exists
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o700); err != nil {
 		return fmt.Errorf("create backup directory: %w", err)
 	}
-	// Remove destination if it already exists (VACUUM INTO requires it not exist)
-	os.Remove(destPath)
-	_, err := s.db.Exec("VACUUM INTO ?", destPath)
-	if err != nil {
+	_ = os.Remove(destPath)
+	if _, err := s.db.Exec("VACUUM INTO ?", destPath); err != nil {
 		return fmt.Errorf("vacuum into: %w", err)
 	}
 	return nil
 }
 
-// Restore replaces the current database with a backup file.
-// The caller must restart the server after calling this.
+// Restore validates a candidate and stages it for atomic application at the
+// next process start. This avoids replacing a live database underneath active
+// requests and background render/export jobs.
 func (s *Store) Restore(srcPath string) error {
-	candidateDB, err := openDatabase(srcPath)
+	candidate, err := openDatabase(srcPath)
 	if err != nil {
 		return fmt.Errorf("open backup database: %w", err)
 	}
-	if err := prepareDatabase(candidateDB); err != nil {
-		candidateDB.Close()
+	if err := prepareDatabase(candidate); err != nil {
+		_ = candidate.Close()
 		return fmt.Errorf("backup file is not compatible: %w", err)
 	}
-	candidateDB.Close()
-
-	// Close current database
-	s.db.Close()
-
-	// Replace the database file
-	srcData, err := os.ReadFile(srcPath)
-	if err != nil {
-		return fmt.Errorf("read backup file: %w", err)
-	}
-	if err := os.WriteFile(s.dbPath, srcData, 0o600); err != nil {
-		return fmt.Errorf("write database file: %w", err)
+	if err := candidate.Close(); err != nil {
+		return fmt.Errorf("close validated backup: %w", err)
 	}
 
-	// Remove WAL and SHM files if present
-	os.Remove(s.dbPath + "-wal")
-	os.Remove(s.dbPath + "-shm")
-
-	// Reopen database
-	db, err := openDatabase(s.dbPath)
-	if err != nil {
-		return fmt.Errorf("reopen database: %w", err)
-	}
-	s.db = db
-	if err := s.prepareDatabase(); err != nil {
-		db.Close()
-		return fmt.Errorf("prepare restored database: %w", err)
+	pendingPath := s.dbPath + pendingRestoreSuffix
+	if err := copyFileDurable(srcPath, pendingPath); err != nil {
+		return fmt.Errorf("stage restored database: %w", err)
 	}
 	return nil
 }
 
-// DB returns the underlying sql.DB for use in handlers if needed.
-func (s *Store) DB() *sql.DB {
-	return s.db
+// RestorePending reports whether a staged database will be applied on restart.
+func (s *Store) RestorePending() bool {
+	_, err := os.Stat(s.dbPath + pendingRestoreSuffix)
+	return err == nil
 }
 
-// openDatabase opens SQLite with the pragmas that need to be encoded into the DSN.
+func applyPendingRestore(dbPath string) error {
+	pendingPath := dbPath + pendingRestoreSuffix
+	if _, err := os.Stat(pendingPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	backupPath := dbPath + ".pre-restore"
+	_ = os.Remove(backupPath)
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := os.Rename(dbPath, backupPath); err != nil {
+			return fmt.Errorf("preserve current database: %w", err)
+		}
+	}
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
+	if err := os.Rename(pendingPath, dbPath); err != nil {
+		if _, backupErr := os.Stat(backupPath); backupErr == nil {
+			_ = os.Rename(backupPath, dbPath)
+		}
+		return fmt.Errorf("publish restored database: %w", err)
+	}
+	_ = os.Chmod(dbPath, 0o600)
+	return nil
+}
+
+func copyFileDurable(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(destination), ".db-restore-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := io.Copy(temporary, input); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	_ = os.Remove(destination)
+	return os.Rename(temporaryPath, destination)
+}
+
+// openDatabase uses one pooled connection so connection-scoped SQLite pragmas
+// such as foreign_keys remain deterministic for all operations.
 func openDatabase(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
 	return db, nil
 }
 
-// prepareDatabase enables required pragmas, runs migrations, applies compatibility
-// columns for older databases, and verifies that the expected schema is present.
 func prepareDatabase(db *sql.DB) error {
-	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"); err != nil {
+	if _, err := db.Exec(`
+		PRAGMA journal_mode=WAL;
+		PRAGMA foreign_keys=ON;
+		PRAGMA synchronous=NORMAL;
+		PRAGMA temp_store=MEMORY;
+	`); err != nil {
 		return fmt.Errorf("set pragmas: %w", err)
 	}
 	if err := migrateDB(db); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 
-	// Add columns that older databases may not have.
 	addColumnIfMissing(db, "custom_presets", "color", "TEXT NOT NULL DEFAULT '#6366f1'")
 	addColumnIfMissing(db, "custom_presets", "sort_order", "INTEGER NOT NULL DEFAULT 0")
-	// Migration 012: audio analysis metadata on segment_takes.
 	addColumnIfMissing(db, "segment_takes", "peak_dbfs", "REAL")
 	addColumnIfMissing(db, "segment_takes", "rms_dbfs", "REAL")
 	addColumnIfMissing(db, "segment_takes", "clipping_detected", "INTEGER NOT NULL DEFAULT 0")
 	addColumnIfMissing(db, "segment_takes", "sample_rate", "INTEGER")
 	addColumnIfMissing(db, "segment_takes", "channels", "INTEGER")
 	addColumnIfMissing(db, "segment_takes", "format", "TEXT")
-	// Migration 015: cast profile assignment on script_segments.
 	addColumnIfMissing(db, "script_segments", "cast_profile_id", "INTEGER")
-	// Migration 018: client workspace linkage.
 	addColumnIfMissing(db, "script_projects", "client_id", "INTEGER REFERENCES clients(id) ON DELETE SET NULL")
 	addColumnIfMissing(db, "pronunciation_dictionaries", "client_id", "INTEGER REFERENCES clients(id) ON DELETE SET NULL")
-	// Migration 019: provider strategy and reproducibility metadata.
 	addColumnIfMissing(db, "script_projects", "fallback_provider", "TEXT")
 	addColumnIfMissing(db, "script_projects", "fallback_model", "TEXT")
 	addColumnIfMissing(db, "script_segments", "fallback_provider", "TEXT")
@@ -178,79 +221,103 @@ func prepareDatabase(db *sql.DB) error {
 	if err := validateSchema(db); err != nil {
 		return fmt.Errorf("validate schema: %w", err)
 	}
-
 	return nil
 }
 
-// prepareDatabase runs database preparation against this Store's connection.
-func (s *Store) prepareDatabase() error {
-	return prepareDatabase(s.db)
-}
+func (s *Store) prepareDatabase() error { return prepareDatabase(s.db) }
 
-// migrateDB reads embedded SQL files and executes them in order.
+// migrateDB executes each embedded migration exactly once and records it in a
+// schema_migrations ledger. Existing databases safely bootstrap because the
+// historical migration scripts are idempotent.
 func migrateDB(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		name TEXT PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create migration ledger: %w", err)
+	}
+	rows, err := db.Query("SELECT name FROM schema_migrations")
+	if err != nil {
+		return fmt.Errorf("list applied migrations: %w", err)
+	}
+	applied := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		applied[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return fmt.Errorf("read migrations dir: %w", err)
 	}
-
-	// Sort by filename to ensure order
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
-
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".sql") || applied[name] {
 			continue
 		}
-
-		data, err := migrationsFS.ReadFile("migrations/" + entry.Name())
+		data, err := migrationsFS.ReadFile("migrations/" + name)
 		if err != nil {
-			return fmt.Errorf("read migration %s: %w", entry.Name(), err)
+			return fmt.Errorf("read migration %s: %w", name, err)
 		}
-
-		slog.Info("applying migration", "file", entry.Name())
-		if _, err := db.Exec(string(data)); err != nil {
-			return fmt.Errorf("execute migration %s: %w", entry.Name(), err)
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", name, err)
 		}
+		if _, err := tx.Exec(string(data)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("execute migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)", name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %s: %w", name, err)
+		}
+		slog.Info("applied migration", "file", name)
 	}
-
 	return nil
 }
 
-// addColumnIfMissing adds a column to a table if it doesn't already exist.
-func addColumnIfMissing(db *sql.DB, table, column, colDef string) {
-	// Check if column exists via PRAGMA
+// SchemaVersion returns the newest recorded migration filename.
+func (s *Store) SchemaVersion() string {
+	var version string
+	_ = s.db.QueryRow("SELECT COALESCE(MAX(name), '') FROM schema_migrations").Scan(&version)
+	return version
+}
+
+func addColumnIfMissing(db *sql.DB, table, column, definition string) {
 	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
-		slog.Warn("failed to check table info", "table", table, "error", err)
+		slog.Warn("failed to inspect table", "table", table, "error", err)
 		return
 	}
-	defer rows.Close()
-
 	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull int
-		var dflt *string
-		var pk int
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			continue
-		}
-		if strings.EqualFold(name, column) {
-			return // column already exists
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue *string
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err == nil && strings.EqualFold(name, column) {
+			_ = rows.Close()
+			return
 		}
 	}
-
-	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, colDef)
-	if _, err := db.Exec(stmt); err != nil {
-		slog.Warn("failed to add column", "table", table, "column", column, "error", err)
+	_ = rows.Close()
+	statement := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)
+	if _, err := db.Exec(statement); err != nil {
+		slog.Warn("failed to add compatibility column", "table", table, "column", column, "error", err)
 	} else {
-		slog.Info("added column", "table", table, "column", column)
+		slog.Info("added compatibility column", "table", table, "column", column)
 	}
 }
 
-// validateSchema verifies the minimum table/column contract expected by handlers.
 func validateSchema(db *sql.DB) error {
 	required := map[string][]string{
 		"api_keys":                          {"id", "provider", "encrypted", "nonce"},
@@ -281,7 +348,6 @@ func validateSchema(db *sql.DB) error {
 		"export_job_items":                  {"id", "export_job_id", "asset_type", "asset_id", "output_name", "status", "error"},
 		"script_prep_jobs":                  {"id", "project_id", "raw_script_hash", "raw_script", "result_json", "status", "error", "created_at", "updated_at"},
 	}
-
 	for table, columns := range required {
 		available, err := tableColumns(db, table)
 		if err != nil {
@@ -293,26 +359,21 @@ func validateSchema(db *sql.DB) error {
 			}
 		}
 	}
-
 	return nil
 }
 
-// tableColumns returns lower-cased column names for a required SQLite table.
 func tableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
 	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
 		return nil, fmt.Errorf("inspect table %s: %w", table, err)
 	}
 	defer rows.Close()
-
 	columns := map[string]struct{}{}
 	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull int
-		var dflt *string
-		var pk int
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue *string
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
 			return nil, fmt.Errorf("scan table info for %s: %w", table, err)
 		}
 		columns[strings.ToLower(name)] = struct{}{}
@@ -323,6 +384,5 @@ func tableColumns(db *sql.DB, table string) (map[string]struct{}, error) {
 	if len(columns) == 0 {
 		return nil, fmt.Errorf("missing required table %s", table)
 	}
-
 	return columns, nil
 }

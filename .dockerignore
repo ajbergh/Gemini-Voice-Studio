@@ -1,7 +1,12 @@
-node_modules
-dist
 .git
 .github
-*.md
-!README.md
+node_modules
+dist
+dist-ssr
+bin
+output
+.playwright-mcp
+docs_internal
 backend/internal/embed/dist
+*.log
+*.exe

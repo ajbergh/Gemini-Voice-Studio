@@ -6,10 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "test": "playwright test",
-    "projects:ui-audit": "node scripts/projects-ui-audit.mjs",
-    "test:ui": "playwright test --ui"
+    "test": "npm run build && playwright test",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "projects:ui-audit": "node scripts/projects-ui-audit.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.31.0",

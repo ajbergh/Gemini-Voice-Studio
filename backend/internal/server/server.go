@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package server assembles the HTTP server with all handlers, routes,
-// middleware (logging, CORS, panic recovery), and the SPA fallback handler
-// for the embedded frontend.
+// middleware, and the SPA fallback handler for the embedded frontend.
 package server
 
 import (
@@ -27,7 +26,6 @@ type Server struct {
 func New(addr string, st *store.Store, cryptoKey []byte, frontendFS fs.FS, audioCacheDir string) *Server {
 	mux := http.NewServeMux()
 
-	// Initialize handlers
 	configH := &handler.ConfigHandler{Store: st}
 	keysH := &handler.KeysHandler{Store: st, CryptoKey: cryptoKey}
 	historyH := &handler.HistoryHandler{Store: st, AudioCacheDir: audioCacheDir}
@@ -38,8 +36,8 @@ func New(addr string, st *store.Store, cryptoKey []byte, frontendFS fs.FS, audio
 	voicesH := &handler.VoicesHandler{Store: st, KeysHandler: keysH, AudioCacheDir: audioCacheDir, ProgressHub: progressH}
 	presetsH := &handler.PresetsHandler{Store: st, AudioCacheDir: audioCacheDir, KeysHandler: keysH}
 	favoritesH := &handler.FavoritesHandler{Store: st}
-	cacheH := &handler.CacheHandler{AudioCacheDir: audioCacheDir}
-	backupH := &handler.BackupHandler{Store: st}
+	cacheH := &handler.CacheHandler{Store: st, AudioCacheDir: audioCacheDir}
+	backupH := &handler.BackupHandler{Store: st, AudioCacheDir: audioCacheDir}
 	batchH := &handler.BatchHandler{
 		Store:         st,
 		KeysHandler:   keysH,
@@ -58,42 +56,33 @@ func New(addr string, st *store.Store, cryptoKey []byte, frontendFS fs.FS, audio
 	exportsH := &handler.ExportsHandler{Store: st, AudioCacheDir: audioCacheDir, ExportCacheDir: exportCacheDir}
 	scriptPrepH := &handler.ScriptPrepHandler{Store: st, KeysHandler: keysH}
 
-	// Register API routes
 	RegisterRoutes(mux, configH, keysH, historyH, voicesH, presetsH, favoritesH, cacheH, backupH, jobsH, projectsH, takesH, batchH, pronunciationH, exportProfilesH, stitchH, castH, stylesH, qcH, clientH, providersH, progressH, exportsH, scriptPrepH)
 
-	// Serve embedded frontend (SPA fallback)
 	if frontendFS != nil {
 		fileServer := http.FileServer(http.FS(frontendFS))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			// If the path starts with /api, it's already handled above (404 for unmatched API routes)
 			if strings.HasPrefix(r.URL.Path, "/api/") {
 				http.NotFound(w, r)
 				return
 			}
 
-			// Try to serve the file; if not found, serve index.html (SPA routing)
 			path := r.URL.Path
 			if path == "/" {
 				path = "/index.html"
 			}
 
-			// Check if file exists in the embedded FS
 			f, err := frontendFS.Open(strings.TrimPrefix(path, "/"))
 			if err != nil {
-				// File not found — serve index.html for SPA routing
 				r.URL.Path = "/index.html"
 			} else {
-				f.Close()
+				_ = f.Close()
 			}
 
 			fileServer.ServeHTTP(w, r)
 		})
 	}
 
-	return &Server{
-		Mux:  mux,
-		Addr: addr,
-	}
+	return &Server{Mux: mux, Addr: addr}
 }
 
 // Handler returns the fully wrapped handler with middleware.

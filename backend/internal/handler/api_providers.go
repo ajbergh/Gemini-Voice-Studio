@@ -8,6 +8,7 @@ package handler
 import (
 	"net/http"
 
+	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/gemini"
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/store"
 )
 
@@ -26,6 +27,7 @@ type ProviderModel struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
 	IsDefault   bool   `json:"is_default,omitempty"`
+	Streaming   bool   `json:"streaming,omitempty"`
 	Notes       string `json:"notes,omitempty"`
 }
 
@@ -43,7 +45,7 @@ type ProviderInfo struct {
 	Models       []ProviderModel      `json:"models"`
 	Voices       []ProviderVoice      `json:"voices"`
 	DefaultModel string               `json:"default_model"`
-	KeyProvider  string               `json:"key_provider"` // key used to fetch from key store
+	KeyProvider  string               `json:"key_provider"`
 }
 
 // ProvidersHandler handles /api/providers endpoints.
@@ -52,7 +54,23 @@ type ProvidersHandler struct {
 	KeysHandler *KeysHandler
 }
 
-// registry is the static list of supported providers.
+func registeredGeminiModels() []ProviderModel {
+	models := gemini.SupportedTTSModels()
+	out := make([]ProviderModel, 0, len(models))
+	for _, model := range models {
+		out = append(out, ProviderModel{
+			ID:          model.ID,
+			DisplayName: model.Name,
+			IsDefault:   model.ID == "gemini-3.1-flash-tts-preview",
+			Streaming:   model.Streaming,
+			Notes:       model.Quality,
+		})
+	}
+	return out
+}
+
+// registry is the static provider list. Model data is sourced from the Gemini
+// package so backend validation, project settings, and API discovery agree.
 var registry = []ProviderInfo{
 	{
 		ID:          "gemini",
@@ -61,16 +79,13 @@ var registry = []ProviderInfo{
 		Capabilities: ProviderCapabilities{
 			SingleSpeakerTTS:  true,
 			MultiSpeakerTTS:   true,
-			Streaming:         false,
+			Streaming:         true,
 			LanguageSelection: true,
 			VoiceList:         true,
 			PCMOutput:         true,
 		},
-		DefaultModel: "gemini-2.5-flash-preview-tts",
-		Models: []ProviderModel{
-			{ID: "gemini-2.5-flash-preview-tts", DisplayName: "Gemini 2.5 Flash TTS", IsDefault: true},
-			{ID: "gemini-2.5-pro-preview-tts", DisplayName: "Gemini 2.5 Pro TTS", Notes: "Higher quality, slower"},
-		},
+		DefaultModel: "gemini-3.1-flash-tts-preview",
+		Models:       registeredGeminiModels(),
 		Voices: []ProviderVoice{
 			{ID: "Zephyr", DisplayName: "Zephyr"},
 			{ID: "Puck", DisplayName: "Puck"},
@@ -106,9 +121,7 @@ var registry = []ProviderInfo{
 	},
 }
 
-// ListProviders returns the static provider registry with key-configured status.
-//
-// GET /api/providers
+// ListProviders returns the provider registry with key-configured status.
 func (h *ProvidersHandler) ListProviders(w http.ResponseWriter, r *http.Request) {
 	type providerResponse struct {
 		ProviderInfo
@@ -116,12 +129,9 @@ func (h *ProvidersHandler) ListProviders(w http.ResponseWriter, r *http.Request)
 	}
 
 	out := make([]providerResponse, len(registry))
-	for i, p := range registry {
-		_, keyErr := h.KeysHandler.GetDecryptedKey(p.KeyProvider)
-		out[i] = providerResponse{
-			ProviderInfo:  p,
-			KeyConfigured: keyErr == nil,
-		}
+	for i, provider := range registry {
+		_, keyErr := h.KeysHandler.GetDecryptedKey(provider.KeyProvider)
+		out[i] = providerResponse{ProviderInfo: provider, KeyConfigured: keyErr == nil}
 	}
 	writeJSON(w, http.StatusOK, out)
 }

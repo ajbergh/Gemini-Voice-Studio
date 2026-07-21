@@ -1,258 +1,276 @@
 # Settings & Administration
 
-This guide covers API key management, cache, backup/restore, pronunciation dictionaries, performance styles, QC rules, and render defaults.
-
----
+This guide covers API-key security, key-pool behavior, render defaults, pronunciation dictionaries, performance styles, QC rules, storage cleanup, backup/restore, export profiles, and runtime configuration.
 
 ## Opening Settings
 
-Click the **Settings** (gear icon) in the left navigation sidebar to open the Settings modal.
+Open **Settings** from the gear icon in the application navigation. Available panels depend on the current build, but the backend contracts described here are authoritative.
 
-![Settings modal showing the API Keys tab with key input and Key Rotation Pool](../assets/screenshots/13-settings-dark.png)
-*The Settings modal provides tabs for Keys, Render defaults, Export profiles, Dictionaries, QC rules, Storage, and Appearance*
+## API keys
 
----
+### Add or replace a key
 
-## API Keys
+1. Open **Settings → API Keys**.
+2. Paste the Gemini API key.
+3. Test it.
+4. Save it.
 
-### Adding an API Key
+The plaintext key is sent only to the Go backend. It is encrypted before being written to SQLite.
 
-1. Go to **Settings → API Keys**
-2. Paste your Gemini API key in the input field
-3. Click **Test** to validate the key against the Gemini API
-4. Click **Save**
+### Encryption format
 
-The key is encrypted with AES-256-GCM and stored in the local SQLite database. It is never stored in plain text.
+New writes use:
 
-> **Get a key:** [Google AI Studio → Create API Key](https://aistudio.google.com/apikey)
+- PBKDF2-HMAC-SHA256 key derivation
+- A random per-installation salt
+- AES-256-GCM authenticated encryption
+- A versioned ciphertext envelope
 
-### Testing a Key
+The installation salt is stored in the generated-media directory with restrictive permissions. Legacy unversioned ciphertext remains decryptable for compatibility.
 
-Click **Test Key** next to any saved key. The backend sends a minimal validation request to Gemini and reports success or failure. A failed test does not delete the key.
+Do not migrate only `data.db`. Copy the whole data directory or use a portable backup so the database, generated media, and encryption metadata remain together.
 
-### Deleting a Key
+### Delete a key
 
-Click **Delete** next to the key. Confirmation is required. After deletion, any future API calls that require Gemini will fail until a new key is saved.
+Deleting a provider key removes the encrypted row. Calls requiring that provider fail until a key is saved or an active pool entry is available.
 
----
+## Key pool
 
-## Key Pool
+A provider can have multiple encrypted keys. The backend leases active entries transactionally using least-recently-used order.
 
-For high-volume use, multiple API keys can be pooled. The backend rotates across pool entries to distribute load and avoid per-key rate limits.
+Pool state includes:
 
-### Adding to the Pool
+- Active or inactive status
+- Last-used time
+- Error count
+- Health state
+- Lease time
+- Cooldown-until time
 
-1. Go to **Settings → API Keys → Pool**
-2. Click **Add Key to Pool**
-3. Paste the key and click **Add**
+Authentication failures and repeated provider errors can place a key into cooldown or deactivate it. Resetting a pool entry clears the error state and makes it eligible again.
 
-### Pool Management
+The leasing transaction prevents concurrent workers from selecting the same key as if it were still idle.
 
-| Action | Description |
-|--------|-------------|
-| **View pool** | See all pool entries with usage counts |
-| **Reset usage** | Reset the rotation counter for the pool |
-| **Remove entry** | Delete a single key from the pool |
+## Render defaults
 
----
+Global defaults apply when a client, project, cast profile, or segment does not provide a more specific value.
 
-## Render Defaults
+Supported TTS models are supplied by `GET /api/providers`:
 
-Global defaults applied to all new segments across all projects (unless overridden at the project or segment level).
+| Model | Streaming |
+|---|---:|
+| `gemini-3.1-flash-tts-preview` | Yes |
+| `gemini-2.5-flash-preview-tts` | No |
+| `gemini-2.5-pro-preview-tts` | No |
 
-| Setting | Description |
-|---------|-------------|
-| **Default Model** | TTS model: `gemini-3.1-flash-tts-preview` (default), `gemini-2.5-flash-preview-tts` |
-| **Default Voice** | Stock voice or custom preset for new segments |
-| **Default Language** | Language code (e.g., `en-US`) or auto-detect |
+The backend rejects unknown model identifiers with HTTP `422` rather than silently substituting another model.
 
----
+Batch concurrency is configurable and is capped at eight workers. The default is two workers when no stored or request-level value is supplied.
 
-## Pronunciation Dictionaries
+## Pronunciation dictionaries
 
-### Global Pronunciation Dictionaries
+### Global dictionaries
 
-Global dictionaries apply their rules to all TTS generation across all projects, evaluated before any project-scoped rules.
+Global dictionaries are evaluated for every project before project-scoped rules.
 
-**Creating a global dictionary:**
-1. Go to **Settings → Pronunciation → Global**
-2. Click **New Dictionary**
-3. Enter a dictionary name
-4. Click **Save**
+Each dictionary can be enabled or disabled and can contain multiple word or phrase overrides. Enabled entries are incorporated into the render instruction and contribute to the stored dictionary hash for take provenance.
 
-**Adding entries:**
-1. Select a dictionary from the list
-2. Click **+ Add Entry**
-3. Enter the **Word or Phrase** and the **Pronunciation Override**
-4. Click **Save Entry**
+### Project dictionaries
 
-The pronunciation override is passed to the TTS model as a phonetic or alternate spelling hint in the system instruction.
+Project dictionaries apply only to their project. They are evaluated after enabled global dictionaries.
 
-**Real-time preview:**
-- Enter sample text in the **Preview** field
-- The dictionary transforms the text in real time so you can verify rules work as intended
+Use the preview function before large renders to verify replacements and avoid unintended substring matches.
 
-**Toggling dictionaries:**
-- Each dictionary has an **Active / Inactive** toggle
-- Inactive dictionaries are excluded from all TTS requests
+## Performance styles
 
-### Project-Scoped Pronunciation Dictionaries
+Performance styles are reusable direction presets. A style can describe:
 
-Project-scoped dictionaries apply only within their project. They are evaluated after global dictionaries (global rules take precedence).
+- Pacing
+- Energy
+- Emotion
+- Articulation
+- Pause density
+- Director notes
 
-**Creating a project dictionary:**
-1. Open a project and click the **Pronunciation** icon in the project toolbar, or
-2. Go to **Settings → Pronunciation** and select a project
-3. Follow the same steps as global dictionaries
+Styles can be global or project-scoped. Saved revisions are versioned so earlier snapshots can be restored.
 
----
+## QC rules
 
-## Performance Styles
+Global QC configuration includes:
 
-Performance Styles are reusable direction presets injected into TTS system instructions.
+| Setting | Behavior |
+|---|---|
+| Default severity | Initial severity for new QC issues |
+| Auto-flag clipping | Creates a QC issue when clipped samples or the configured peak threshold are detected |
+| Clipping threshold | Peak dBFS threshold used by automated analysis |
+| Export only approved | Requires the selected take to have `approved` status before it is included |
+| Notes export format | Controls the configured notes representation where supported |
 
-### Global Styles
+Automated clipping analysis runs after audio is durably published and the take is persisted.
 
-Available across all projects.
+## Storage management
 
-1. Go to **Settings → Performance Styles**
-2. Click **New Style**
-3. Fill in:
+Generated audio referenced by application records is durable production data, not disposable cache.
+
+The storage statistics endpoint reports:
+
+- Total files and bytes
+- Protected files and bytes
+- Reclaimable files and bytes
+- The active media directory
+
+Protected media includes files referenced by:
+
+- Generation history
+- Custom preset samples
+- Segment takes
+- Preset artwork metadata
+- Installation encryption metadata
+
+**Clear Cache** removes only unreferenced files. It does not intentionally break history entries, presets, or project takes.
+
+Deleting a history entry or take can make its media reclaimable if no other record references the same file.
+
+## Portable backup
+
+Create a backup from the UI or with:
+
+```bash
+curl -X POST http://localhost:8080/api/backup \
+  --output gemini-voice-studio.gvsbackup
+```
+
+The server creates a consistent SQLite snapshot and packages it with durable media.
+
+A `.gvsbackup` archive contains:
+
+- `database/data.db`
+- Files under `media/`
+- `manifest.json`
+- File sizes
+- SHA-256 checksums
+- Format version and creation time
+
+The archive includes the installation salt because it resides in the media directory. This allows encrypted API-key rows to remain decryptable after a full migration when the same passphrase is used.
+
+## Restore
+
+Restore with:
+
+```bash
+curl -X POST http://localhost:8080/api/restore \
+  -F "backup=@gemini-voice-studio.gvsbackup"
+```
+
+The multipart form field is named `backup`.
+
+Restore processing:
+
+1. Limits the upload size.
+2. Detects portable ZIP versus legacy database-only format.
+3. Rejects unsafe archive paths and symlinks.
+4. Validates the manifest, file sizes, and SHA-256 checksums.
+5. Validates the SQLite snapshot.
+6. Stages media files.
+7. Stages the database as `restore-pending.db`.
+8. Applies the database atomically on the next application start.
+
+Restart the process or container after a successful restore response.
+
+A restore replaces the current application dataset. Create a fresh backup before restoring when the current state may be needed later.
+
+Legacy database-only backups remain accepted, but they do not contain generated media or encryption metadata and are therefore not a complete migration mechanism.
+
+## Export profiles
+
+Export profiles currently control deterministic PCM finishing:
 
 | Field | Description |
-|-------|-------------|
-| **Name** | Display name for the style |
-| **Description** | Brief summary |
-| **Category** | Narration, Commercial, Education, Character, Documentary, Meditation, Horror, Comedy |
-| **Pacing** | Slow / Measured / Conversational / Brisk / Rapid |
-| **Energy** | Subdued / Calm / Moderate / Engaged / High |
-| **Emotion** | Neutral / Warm / Authoritative / Intimate / Dramatic / Playful / Suspenseful |
-| **Articulation** | Relaxed / Clear / Crisp / Heightened |
-| **Pause Density** | Sparse / Moderate / Frequent / Dramatic |
-| **Director Notes** | Free-text direction injected into the system prompt |
+|---|---|
+| Target kind | Named delivery use or category |
+| Trim silence | Remove leading and trailing PCM below the threshold |
+| Silence threshold dB | Threshold used by trimming |
+| Leading silence ms | Padding before each finished segment and the master |
+| Trailing silence ms | Padding after each finished segment and the master |
+| Inter-segment silence ms | Spacing inserted between master segments |
+| Normalize peak dB | Target peak used by PCM normalization |
+| Metadata JSON | Optional profile metadata |
 
-4. Click **Save**
+Current packaged audio is WAV at 24 kHz, 16-bit, mono. MP3, FLAC, arbitrary sample-rate conversion, LUFS normalization, and metadata embedding are not implemented and should not be presented as available profile options.
 
-### Style Version History
+The stitch endpoint and ZIP exporter use the same shared finishing functions, preventing profile drift between the standalone master and packaged deliverable.
 
-Every save of a style creates a version snapshot. To revert:
-1. Open the style editor
-2. Click **View History**
-3. Click **Revert** next to any prior version
+## Runtime configuration
 
----
+Runtime configuration uses this precedence:
 
-## QC Rules
+1. Platform defaults
+2. Optional JSON file
+3. `GVS_*` environment variables
+4. Explicit CLI flags
 
-Configure default quality-control behavior.
+Desktop builds bind to `127.0.0.1` by default. Binding to `0.0.0.0` or `::` exposes the HTTP server through available network interfaces. The application does not provide TLS or user authentication, so use an external trusted proxy and network controls before allowing remote access.
 
-1. Go to **Settings → QC Rules**
+### Environment variables
 
-| Setting | Description |
-|---------|-------------|
-| **Default Severity** | Pre-selected issue severity: Low / Medium / High |
-| **Auto-Flag Clipping** | Automatically flag segments with audio clipping detected |
-| **Clipping Threshold (dBFS)** | Threshold for clipping detection (e.g., `-1.0`) |
-| **Export Only Approved** | Only include approved takes in exports |
-| **Notes Export Format** | QC notes export format: CSV or Markdown |
+| Variable | Purpose |
+|---|---|
+| `GVS_CONFIG` | JSON configuration path |
+| `GVS_HOST` | HTTP bind host |
+| `GVS_PORT` | HTTP port |
+| `GVS_DATA_DIR` | Persistent root directory |
+| `GVS_DB_PATH` | SQLite path |
+| `GVS_AUDIO_DIR` | Generated-media path |
+| `GVS_PASSPHRASE` | Encryption passphrase |
+| `GVS_LOG_LEVEL` | `debug`, `info`, `warn`, or `error` |
+| `GVS_OPEN_BROWSER` | Boolean browser-open setting |
 
----
+### CLI flags
 
-## Cache Management
-
-Generated audio is cached on disk for fast re-playback without re-generating. Over time, cache can grow significantly for large projects.
-
-**Viewing cache stats:**
-1. Go to **Settings → Cache**
-2. Stats show total cached files, total size, and per-type breakdown
-
-**Clearing the cache:**
-1. Click **Clear Cache**
-2. Confirm the action
-
-> **Note:** Clearing the cache removes audio files from disk. History entries remain in the database but will need to re-generate audio on next playback.
-
----
-
-## Backup & Restore
-
-### Creating a Backup
-
-1. Go to **Settings → Backup**
-2. Click **Create Backup**
-3. A JSON export of the entire database is downloaded
-
-The backup includes all projects, segments, takes, cast profiles, presets, history, API keys (encrypted), and configuration.
-
-**API equivalent:**
-```bash
-curl -X POST http://localhost:8080/api/backup -o backup.json
+```text
+--config
+--host
+--port
+--data-dir
+--db
+--audio-dir
+--passphrase
+--log-level
+--open
+--version
 ```
 
-### Restoring from Backup
+The passphrase is not serialized into JSON configuration.
 
-1. Go to **Settings → Backup**
-2. Click **Restore from File**
-3. Select the backup JSON file
-4. Confirm — the current database is replaced
+## Default data directories
 
-> **Warning:** Restore overwrites all current data. Create a new backup first if you want to preserve the current state.
+| Platform | New installation path |
+|---|---|
+| Windows | `%APPDATA%\gemini-voice-studio` |
+| macOS | `~/Library/Application Support/gemini-voice-studio` |
+| Linux | `$XDG_DATA_HOME/gemini-voice-studio` or `~/.local/share/gemini-voice-studio` |
 
-**API equivalent:**
-```bash
-curl -X POST http://localhost:8080/api/restore -F "file=@backup.json"
-```
+For upgrade compatibility, an existing `gemini-voice-library` directory is reused when no new directory exists. An existing `audio_cache` subdirectory is likewise reused when no `audio` directory exists.
 
----
+## Health and diagnostics
 
-## Export Profiles
+`GET /api/health` reports:
 
-Export Profiles define finishing settings for deliverable packaging.
+- Health status
+- Version
+- Commit SHA
+- Build date
+- Database schema version
 
-1. Go to **Settings → Export Profiles**
-2. Click **New Profile**
-3. Configure:
+The same build information is available through `--version`, and startup logs include the resolved bind address, database path, and media path.
 
-| Setting | Options |
-|---------|---------|
-| **Name** | Display name |
-| **Format** | WAV, MP3, FLAC |
-| **Sample Rate** | 24kHz, 44.1kHz, 48kHz |
-| **Bit Depth** | 16-bit, 24-bit, 32-bit |
-| **Normalization** | None, Peak, Loudness (LUFS) |
-| **Target Loudness** | e.g., `-16` LUFS for podcast, `-23` LUFS for broadcast |
-| **Include Metadata** | Embed ID3/BWF metadata tags |
+## Administrative checklist
 
-Profiles appear in the **Export Profile** dropdown in the project Export dialog and the Timeline stitch toolbar.
+Before upgrading, migrating, or restoring:
 
----
-
-## App Configuration
-
-Low-level configuration is accessible via `GET/PUT /api/config` or through Settings:
-
-| Key | Description |
-|-----|-------------|
-| `default_model` | Global default TTS model |
-| `default_voice` | Global default voice name |
-| `default_language` | Global default language code |
-| `theme` | `light` or `dark` |
-| `accent_color` | UI accent color: indigo, blue, violet, rose, emerald, amber |
-
----
-
-## Client Workspaces
-
-Clients allow organizing projects under brand contexts.
-
-1. Go to **Settings → Clients** or click **Clients** in the navigation sidebar
-2. Click **New Client**
-3. Fill in:
-   - **Name** — Brand or client name
-   - **Description** — Optional brand summary
-   - **Brand Notes** — Notes on voice preferences, style guidelines
-   - **Default Voice** — Voice used for new projects under this client
-   - **Default Model** — TTS model used for this client's projects
-4. Click **Save**
-
-When creating a new project, select the client to inherit its defaults.
+1. Create a portable backup.
+2. Confirm the backup file is non-empty.
+3. Record the passphrase source.
+4. Stop active renders before moving the data directory.
+5. Restart after restore.
+6. Verify `/api/health` and play at least one existing take.

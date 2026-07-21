@@ -6,7 +6,10 @@ services:
     volumes:
       - app-data:/home/app/data
     environment:
-      - GEMINI_PASSPHRASE=${GEMINI_PASSPHRASE:-}
+      GVS_HOST: 0.0.0.0
+      GVS_PASSPHRASE: ${GVS_PASSPHRASE:-}
+      GVS_LOG_LEVEL: ${GVS_LOG_LEVEL:-info}
+      GVS_OPEN_BROWSER: "false"
     restart: unless-stopped
 
 volumes:

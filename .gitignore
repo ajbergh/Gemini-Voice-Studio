@@ -17,6 +17,11 @@ bin/
 output/
 *.exe
 
+# Keep a placeholder so go:embed works in a clean checkout.
+!backend/internal/embed/dist/
+backend/internal/embed/dist/*
+!backend/internal/embed/dist/.gitkeep
+
 # Local env/config files
 *.local
 
@@ -34,8 +39,5 @@ docs_internal/
 *.sln
 *.sw?
 
-# Optional: only ignore this if you truly do not want GitHub workflows/config tracked
-.github/
-
-# Playwright MCP
+# Local Playwright MCP captures
 .playwright-mcp/
