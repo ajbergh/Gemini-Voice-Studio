@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "Optional JSON configuration file")
+	host := flag.String("host", "", "HTTP server bind host")
 	port := flag.Int("port", 0, "HTTP server port")
 	dataDir := flag.String("data-dir", "", "Persistent application data directory")
 	dbPath := flag.String("db", "", "SQLite database path")
@@ -65,6 +67,9 @@ func main() {
 
 	provided := map[string]bool{}
 	flag.Visit(func(current *flag.Flag) { provided[current.Name] = true })
+	if provided["host"] {
+		cfg.Host = *host
+	}
 	if provided["data-dir"] {
 		cfg.DataDir = filepath.Clean(*dataDir)
 		cfg.DBPath = filepath.Join(cfg.DataDir, "data.db")
@@ -129,7 +134,7 @@ func main() {
 	defer st.Close()
 
 	frontendFS := fe.FrontendFS()
-	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	srv := server.New(addr, st, cryptoKey, frontendFS, cfg.AudioCacheDir)
 	httpServer := &http.Server{
 		Addr: addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second,
@@ -149,7 +154,11 @@ func main() {
 		}
 	}()
 
-	url := fmt.Sprintf("http://localhost:%d", cfg.Port)
+	browserHost := cfg.Host
+	if browserHost == "0.0.0.0" || browserHost == "::" {
+		browserHost = "localhost"
+	}
+	url := fmt.Sprintf("http://%s", net.JoinHostPort(browserHost, fmt.Sprintf("%d", cfg.Port)))
 	if cfg.OpenBrowser {
 		go func() {
 			time.Sleep(500 * time.Millisecond)
@@ -157,7 +166,7 @@ func main() {
 		}()
 	}
 	slog.Info("starting server",
-		"addr", url, "db", cfg.DBPath, "audio_dir", cfg.AudioCacheDir,
+		"addr", addr, "url", url, "db", cfg.DBPath, "audio_dir", cfg.AudioCacheDir,
 		"version", buildinfo.Version, "commit", buildinfo.Commit,
 		"schema", st.SchemaVersion(),
 	)
