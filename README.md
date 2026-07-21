@@ -149,11 +149,14 @@ Configuration is resolved in this order, with later sources overriding earlier o
 3. `GVS_*` environment variables
 4. Explicit CLI flags
 
+Desktop builds default to `127.0.0.1`. Binding to `0.0.0.0` or `::` exposes the HTTP server to other hosts and should be used only with appropriate network controls.
+
 ### CLI flags
 
 | Flag | Purpose |
 |---|---|
 | `--config PATH` | Optional JSON configuration file |
+| `--host HOST` | Bind host; default `127.0.0.1` |
 | `--port N` | HTTP port; default `8080` |
 | `--data-dir PATH` | Root directory for SQLite and generated media |
 | `--db PATH` | Explicit SQLite database path |
@@ -168,6 +171,7 @@ Configuration is resolved in this order, with later sources overriding earlier o
 | Variable | Equivalent |
 |---|---|
 | `GVS_CONFIG` | `--config` |
+| `GVS_HOST` | `--host` |
 | `GVS_PORT` | `--port` |
 | `GVS_DATA_DIR` | `--data-dir` |
 | `GVS_DB_PATH` | `--db` |
@@ -180,6 +184,7 @@ Example JSON configuration:
 
 ```json
 {
+  "host": "127.0.0.1",
   "port": 8080,
   "data_dir": "/srv/gemini-voice-studio",
   "db_path": "/srv/gemini-voice-studio/data.db",
@@ -206,7 +211,7 @@ The directory contains:
 ```text
 data.db              SQLite database
 audio/               generated audio, preset media, and encryption salt
-exports/             generated export archives when applicable
+export_cache/        generated export archives
 restore-pending.db   validated database restore waiting for restart, when present
 ```
 
@@ -246,7 +251,7 @@ Restore validation completes while the application is running, but the database 
 docker compose up --build
 ```
 
-The application is available at `http://localhost:8080`. The Compose file mounts the named `app-data` volume at `/home/app/data` and supplies the supported `GVS_*` variables.
+The application is available at `http://localhost:8080`. The image binds to `0.0.0.0` inside the container, while Compose publishes port `8080` and mounts the named `app-data` volume at `/home/app/data`.
 
 Example:
 
@@ -298,7 +303,7 @@ Windows Authenticode signing and Apple notarization are not enabled until the re
 
 ## Health and diagnostics
 
-`GET /api/health` reports application health plus version, commit, build date, and schema version. Startup logs include the resolved database and audio paths.
+`GET /api/health` reports application health plus version, commit, build date, and schema version. Startup logs include the resolved bind address, database path, and audio path.
 
 ## License
 
