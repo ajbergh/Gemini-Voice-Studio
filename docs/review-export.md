@@ -1,238 +1,175 @@
 # Review & Export
 
-This guide covers the full quality-control and delivery pipeline: reviewing takes, flagging issues, approving segments, and packaging the final deliverable.
+This guide covers take review, approval, QC issues, export readiness, finishing profiles, stitched WAV generation, and ZIP deliverables.
 
-![Review Mode showing the segment queue on the left and take player with Approve/Flag controls on the right](../assets/screenshots/11-review-qc-dark.png)
-*Review Mode — the queue (left) lists all segments by status; the player (right) provides approve, flag, and QC marker controls*
+## Review workflow
 
----
+Open a project and select **Review**. The workspace combines the segment queue, selected-take player, and QC issues for the active segment.
 
-## Review Mode
-
-### Opening Review Mode
-
-In any project, click the **Review** tab in the project navigation bar. Review Mode can also be opened in full-screen by clicking the **Expand** icon.
-
-### Layout
-
-Review Mode has three panels:
-
-| Panel | Description |
-|-------|-------------|
-| **Review Queue** (left) | List of all segments with status indicators |
-| **Take Player** (center) | Audio player with waveform and approval controls |
-| **QC Issues** (right) | List of quality-control issues for the selected segment |
-
----
-
-## Review Queue
-
-The queue shows all project segments. Filter by status using the tabs at the top:
+### Queue filters
 
 | Filter | Shows |
-|--------|-------|
-| **All** | Every segment |
-| **Unreviewed** | Segments with no approve/flag decision |
-| **Flagged** | Segments marked with issues |
-| **Open Issues** | Segments that have unresolved QC issues |
+|---|---|
+| All | Every segment |
+| Unreviewed | Segments without an approve or flag decision |
+| Flagged | Segments whose selected take is flagged |
+| Open Issues | Segments with unresolved QC issues |
 
-Each row shows:
-- Segment text preview
-- Status icon (check = approved, flag = flagged, alert = open issues)
-- QC issue count badge (when issues exist)
+### Review shortcuts
 
-Click any row to load that segment's best take in the player.
+| Action | Key |
+|---|---|
+| Play or pause | `Space` |
+| Approve | `A` |
+| Flag | `F` |
+| Replay | `R` |
+| Previous segment | `P` |
+| Next segment | `N` |
+| Add QC marker | `M` |
 
----
+## Approve and flag
 
-## Take Player
+Approving a take marks it ready for delivery. Flagging records that the take requires attention or replacement.
 
-The center panel plays the currently selected segment's take.
+The global **Export only approved** rule determines whether the exporter may include a rendered but unapproved take. When the rule is enabled, a segment without an approved take is omitted from the package.
 
-**Transport Controls:**
+## QC issues
 
-| Action | Button | Keyboard |
-|--------|--------|----------|
-| Play / Pause | ▶ / ⏸ | `Space` |
-| Replay (restart) | ↩ | `R` |
-| Previous segment | ⏮ | `P` |
-| Next segment | ⏭ | `N` |
-| Approve | ✓ | `A` |
-| Flag | ⚑ | `F` |
-| Add QC Marker | ◉ | `M` |
+A QC issue records a structured problem against a project segment and, when available, a specific take.
 
-**Waveform:**
-- Displays the waveform of the current take
-- Click anywhere on the waveform to seek to that position
+Issues include:
 
----
+- Issue type
+- Severity
+- Note
+- Optional time offset
+- Open, resolved, or won't-fix status
+- Optional take reference
 
-## Approving and Flagging Takes
+Automated clipping analysis can create a high-severity volume issue after rendering when clipped PCM samples are detected or the configured peak threshold is reached.
 
-### Approve
+## Timeline and readiness
 
-Click **Approve** (or press `A`) to mark the current take as ready for export.
+The Timeline view presents segment waveforms and delivery state in script order. Use it to inspect pacing, find missing audio, and confirm approval coverage.
 
-- The segment status changes to **Approved**
-- The segment row in the queue shows a green checkmark
-- Approved takes are included in export
+Typical readiness blockers are:
 
-### Flag
+- Draft or changed segments without current audio
+- Segments without an eligible take
+- Unapproved takes when approval-only export is enabled
+- Open QC issues that must be resolved under the team's delivery policy
 
-Click **Flag** (or press `F`) to mark the current take as having issues.
+**Render missing** starts a bounded-concurrency batch job for eligible draft and changed segments. Progress and cancellation are available through the Job Center.
 
-- The segment status changes to **Flagged**
-- The segment row shows an orange flag icon
-- Flagged segments are excluded from export by default (configurable in QC Rules)
+## Export profiles
 
----
+Export profiles are deterministic PCM finishing profiles. They currently control:
 
-## QC Issues
+| Setting | Behavior |
+|---|---|
+| Trim silence | Removes leading and trailing PCM below the threshold |
+| Silence threshold dB | Threshold used by the trim operation |
+| Leading silence ms | Adds padding before each segment and the master |
+| Trailing silence ms | Adds padding after each segment and the master |
+| Inter-segment silence ms | Inserts spacing between master segments |
+| Normalize peak dB | Applies peak normalization |
+| Target kind | Names the intended delivery category |
+| Metadata JSON | Stores optional profile metadata |
 
-QC Issues are structured notes attached to a specific segment documenting problems found during review.
+The current audio output is 24 kHz, 16-bit, mono WAV. MP3, FLAC, arbitrary sample-rate conversion, arbitrary bit-depth conversion, LUFS normalization, and metadata embedding are not implemented.
 
-### Creating a QC Issue
+## Start an export
 
-1. Press `M` or click **Add Marker** during review
-2. The QC Issue dialog opens
-3. Fill in:
-   - **Severity**: Low (blue), Medium (yellow), High (red)
-   - **Notes**: Description of the issue
-4. Click **Save**
+1. Open the project **Export** tab.
+2. Select an export profile when finishing is required.
+3. Review the readiness summary.
+4. Start the export.
+5. Track the background job in the Job Center.
+6. Download the ZIP after the job reaches `complete`.
 
-### Managing Issues
+The exporter streams the ZIP to a temporary file in the export directory and atomically publishes the completed archive. It does not buffer the entire deliverable in memory.
 
-The **QC Issues panel** (right side of Review Mode) shows all issues for the selected segment.
+Cancellation is checked while the package is assembled. Failed or cancelled work does not publish a partial ZIP as a completed export.
 
-| Action | How |
-|--------|-----|
-| **Resolve** | Click the checkmark icon — marks status as Resolved |
-| **Won't Fix** | Click the X icon — marks status as Won't Fix |
-| **Edit** | Click the pencil icon — edit severity or notes |
-| **Delete** | Click the trash icon |
+## ZIP contents
 
-### Issue Statuses
+A completed package can contain:
 
-| Status | Icon | Meaning |
-|--------|------|---------|
-| **Open** | Alert triangle | Active issue needing attention |
-| **Resolved** | Checkmark | Issue addressed and fixed |
-| **Won't Fix** | X | Issue acknowledged but not going to be corrected |
+```text
+audio/
+  001-<voice>.wav
+  002-<voice>.wav
+  ...
+  project-master.wav
+project.json
+cast-bible.json
+pronunciation-dictionary.json
+qc-issues.csv
+render-metadata.json
+README.txt
+```
 
----
+### Per-segment WAV files
 
-## QC Rules
+Each included take is written as a finished WAV using the selected profile. The filename is ordered and sanitized for portability.
 
-Configure default QC behavior in **Settings → QC Rules** (or accessible from the gear icon in Review Mode):
+### Project master
 
-| Setting | Description |
-|---------|-------------|
-| **Default Severity** | Pre-selected severity for new issues (Low/Medium/High) |
-| **Auto-Flag Clipping** | Automatically flag segments with detected audio clipping |
-| **Clipping Threshold** | dBFS level that triggers clipping detection (e.g., -1.0) |
-| **Export Only Approved** | If enabled, only approved segments are included in export |
-| **Notes Export Format** | CSV or Markdown for exported QC notes |
+`audio/project-master.wav` concatenates the selected takes in project order. The profile's inter-segment spacing is inserted between segments, followed by master-level leading/trailing padding and peak normalization.
 
----
+### Metadata files
 
-## Timeline Review
+- `project.json` contains project, section, segment, and selected-take data.
+- `cast-bible.json` contains project cast profiles.
+- `pronunciation-dictionary.json` contains enabled project pronunciation entries.
+- `qc-issues.csv` contains exported QC issues.
+- `render-metadata.json` records selected take provenance, provider/model values, audio format, and profile information.
 
-The **Timeline** tab provides a scrollable waveform view of all segments in sequence, useful for checking pacing and checking export readiness.
+## Take selection
 
-### Features
+For each segment, the exporter asks the store for the best eligible take. When approval-only export is enabled, the selected take must have `approved` status.
 
-- **Waveform per segment** — Each segment row shows a visual waveform of its best take
-- **Click to seek** — Click anywhere on a waveform to seek to that position in playback
-- **Status badges** — Each row shows the segment's approval status
-- **Collapse/expand rows** — Focus on specific sections by collapsing others
-
-### Export Readiness Checklist
-
-At the top of the Timeline tab, the readiness checklist shows:
-
-- How many segments are approved out of total
-- How many segments still have open QC issues
-- Whether any segments are still in draft/changed state
-
-### Render Missing Audio
-
-If any segments are in draft or changed state, a **Render Missing** button appears. Click it to batch-render all segments that don't have current audio.
-
----
-
-## Export
-
-![Export tab showing readiness checklist with rendered/approved counts and blockers](../assets/screenshots/12-export-dark.png)
-*The Export tab shows the finishing profile picker, audio scope summary, and a readiness checklist before packaging*
-
-### Starting an Export
-
-1. Click the **Export** tab in the project navigation bar
-2. Optionally select an **Export Profile** (finishing settings)
-3. Review the export readiness checklist
-4. Click **Start Export**
-
-A background job is created. Export progress appears in the **Job Center** drawer.
-
-### Export Profiles
-
-Export Profiles control how audio is processed during packaging:
-
-| Setting | Options |
-|---------|---------|
-| **Format** | WAV, MP3, FLAC |
-| **Bit Depth** | 16-bit, 24-bit, 32-bit |
-| **Sample Rate** | 24kHz, 44.1kHz, 48kHz |
-| **Normalization** | None, Peak, Loudness (LUFS) |
-| **Target Loudness** | e.g., -16 LUFS for podcasts, -23 LUFS for broadcast |
-| **Metadata** | Include/exclude ID3 or BWF metadata |
-
-**Managing profiles:**
-1. Go to **Settings → Export Profiles**
-2. Click **New Profile** to create a named configuration
-3. Profiles appear in the Export Profile dropdown in the Export dialog
-
-### Downloading the Export
-
-When the export job completes:
-
-1. A **Download ZIP** button appears in the Export dialog
-2. Click to download a ZIP archive containing all approved segments
-3. The ZIP can be re-downloaded from the **Prior Exports** list
-
----
+A take with a missing or unreadable audio path fails the export instead of creating a package that claims to contain complete audio.
 
 ## Stitch to WAV
 
-The Timeline tab provides a **Stitch to WAV** button that concatenates all approved segments into a single continuous WAV file.
+The stitch endpoint creates a master WAV directly without starting an export job.
 
-1. Open the **Timeline** tab
-2. Select an export profile from the dropdown
-3. Click **Download Stitched WAV**
+1. Open the Timeline or stitch action.
+2. Optionally choose a profile.
+3. Optionally choose a section.
+4. Download the generated WAV.
 
-The stitched file is generated server-side and downloaded directly — no job required.
+Stitching and ZIP packaging use the same shared audio-finishing package, so silence trimming, padding, inter-segment spacing, peak normalization, and WAV encoding behave consistently.
 
----
+The stitch workflow skips segments without readable audio. It returns an error when no renderable segment remains.
 
-## Job Center
+## Job states
 
-All background jobs (batch renders, exports, script prep) are visible in the **Job Center** drawer.
+Background jobs can report:
 
-Click the **Jobs** icon (briefcase) in the left sidebar to open it.
+- `queued`
+- `running`
+- `complete`
+- `partial`
+- `failed`
+- `cancelled`
 
-| Column | Description |
-|--------|-------------|
-| **Type** | Job type (Render, Export, Script Prep, etc.) |
-| **Status** | Running / Complete / Failed |
-| **Progress** | Percentage complete with progress bar |
-| **Age** | Relative timestamp (e.g., "5m ago") |
-| **Actions** | Cancel (running) or Delete (completed/failed) |
+Batch rendering uses `partial` when some segments complete and others fail. Export jobs publish a downloadable file only after complete archive finalization.
 
----
+## Operational checks before delivery
 
-## Tips
+1. Confirm the latest script changes are rendered.
+2. Review all intended takes.
+3. Resolve or explicitly accept open QC issues.
+4. Verify approval-only policy.
+5. Select the intended finishing profile.
+6. Download and inspect the master WAV.
+7. Verify the package metadata and segment count.
+8. Retain the ZIP and a portable application backup separately.
 
-- Use keyboard shortcuts during review for maximum efficiency — `A` to approve, `F` to flag, `N/P` to navigate, no mouse required
-- Configure **Auto-Flag Clipping** in QC Rules to automatically catch audio clipping artifacts before manual review
-- Set **Export Only Approved** in QC Rules to prevent accidentally exporting unreviewed takes
-- Export Profiles can be shared across projects for consistent delivery standards per client
+## Related guides
+
+- [Projects](projects.md)
+- [Settings & Administration](settings-administration.md)
+- [Keyboard Shortcuts](keyboard-shortcuts.md)
