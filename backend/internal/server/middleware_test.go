@@ -28,6 +28,30 @@ func TestOriginProtectionMiddleware(t *testing.T) {
 		}
 	})
 
+	t.Run("allows exact same origin for configured host", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "http://studio.internal:8080/api/keys", nil)
+		req.Header.Set("Origin", "http://studio.internal:8080")
+		res := httptest.NewRecorder()
+
+		handler.ServeHTTP(res, req)
+
+		if res.Code != http.StatusNoContent {
+			t.Fatalf("expected same-origin request to pass, got %d", res.Code)
+		}
+	})
+
+	t.Run("rejects same hostname on a different port", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "http://studio.internal:8080/api/keys", nil)
+		req.Header.Set("Origin", "http://studio.internal:4000")
+		res := httptest.NewRecorder()
+
+		handler.ServeHTTP(res, req)
+
+		if res.Code != http.StatusForbidden {
+			t.Fatalf("expected different-port origin to be forbidden, got %d", res.Code)
+		}
+	})
+
 	t.Run("rejects cross-site origin", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1/api/history", nil)
 		req.Header.Set("Origin", "https://evil.example")
