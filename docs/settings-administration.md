@@ -15,7 +15,7 @@ Open **Settings** from the gear icon in the application navigation. Available pa
 3. Test it.
 4. Save it.
 
-The plaintext key is sent only to the local Go backend. It is encrypted before being written to SQLite.
+The plaintext key is sent only to the Go backend. It is encrypted before being written to SQLite.
 
 ### Encryption format
 
@@ -209,11 +209,14 @@ Runtime configuration uses this precedence:
 3. `GVS_*` environment variables
 4. Explicit CLI flags
 
+Desktop builds bind to `127.0.0.1` by default. Binding to `0.0.0.0` or `::` exposes the HTTP server through available network interfaces. The application does not provide TLS or user authentication, so use an external trusted proxy and network controls before allowing remote access.
+
 ### Environment variables
 
 | Variable | Purpose |
 |---|---|
 | `GVS_CONFIG` | JSON configuration path |
+| `GVS_HOST` | HTTP bind host |
 | `GVS_PORT` | HTTP port |
 | `GVS_DATA_DIR` | Persistent root directory |
 | `GVS_DB_PATH` | SQLite path |
@@ -226,6 +229,7 @@ Runtime configuration uses this precedence:
 
 ```text
 --config
+--host
 --port
 --data-dir
 --db
@@ -258,7 +262,7 @@ For upgrade compatibility, an existing `gemini-voice-library` directory is reuse
 - Build date
 - Database schema version
 
-The same build information is available through `--version`, and startup logs include the resolved database and media paths.
+The same build information is available through `--version`, and startup logs include the resolved bind address, database path, and media path.
 
 ## Administrative checklist
 
