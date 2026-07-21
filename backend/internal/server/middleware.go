@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package server — middleware.go provides HTTP middleware for structured
-// request logging (slog), panic recovery, CORS headers, and an interface-
-// preserving status-capturing ResponseWriter wrapper.
+// request logging (slog), panic recovery, CORS headers, origin protection, and
+// an interface-preserving status-capturing ResponseWriter wrapper.
 package server
 
 import (
@@ -46,11 +46,10 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// corsMiddleware adds CORS headers for development mode.
+// corsMiddleware adds CORS headers for the localhost development frontend.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		// Only allow localhost origins to prevent cross-origin abuse.
 		if origin != "" && isLocalhostOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Add("Vary", "Origin")
@@ -67,8 +66,10 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// originProtectionMiddleware rejects unsafe browser requests from non-local origins.
-// This reduces cross-site request risks for a localhost-only application.
+// originProtectionMiddleware rejects unsafe browser requests unless their
+// Origin/Referer is localhost or exactly matches the request host. Exact
+// same-origin matching supports the embedded app behind Docker or a trusted
+// reverse proxy without allowing arbitrary cross-site writes.
 func originProtectionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !requiresTrustedOrigin(r.Method) || requestHasTrustedOrigin(r) {
@@ -95,12 +96,23 @@ func requiresTrustedOrigin(method string) bool {
 // requestHasTrustedOrigin validates Origin or Referer when the browser sends one.
 func requestHasTrustedOrigin(r *http.Request) bool {
 	if origin := r.Header.Get("Origin"); origin != "" {
-		return isLocalhostOrigin(origin)
+		return isTrustedRequestOrigin(origin, r.Host)
 	}
 	if referer := r.Header.Get("Referer"); referer != "" {
-		return isLocalhostOrigin(referer)
+		return isTrustedRequestOrigin(referer, r.Host)
 	}
 	return true
+}
+
+func isTrustedRequestOrigin(rawOrigin, requestHost string) bool {
+	if isLocalhostOrigin(rawOrigin) {
+		return true
+	}
+	parsed, err := url.Parse(rawOrigin)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	return requestHost != "" && strings.EqualFold(parsed.Host, requestHost)
 }
 
 // isLocalhostOrigin checks if an origin is localhost or a loopback IP.
