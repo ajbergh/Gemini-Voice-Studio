@@ -14,6 +14,7 @@ import (
 
 // Config holds the application runtime configuration.
 type Config struct {
+	Host          string `json:"host"`
 	Port          int    `json:"port"`
 	DBPath        string `json:"db_path"`
 	Passphrase    string `json:"-"`
@@ -34,6 +35,7 @@ func DefaultConfig() Config {
 		audioDir = legacyAudioDir
 	}
 	return Config{
+		Host:          "127.0.0.1",
 		Port:          8080,
 		DBPath:        filepath.Join(dataDir, "data.db"),
 		LogLevel:      "info",
