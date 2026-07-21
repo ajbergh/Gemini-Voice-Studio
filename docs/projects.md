@@ -1,290 +1,274 @@
 # Projects
 
-The Projects workspace is the full production pipeline for multi-segment voiceover, audiobook, podcast, and training audio. It provides section and segment management, per-segment voice assignment, batch rendering, take history, cast management, pronunciation dictionaries, review/QC workflows, and deliverable export.
+The Projects workspace is the production pipeline for multi-segment narration, audiobook, podcast, training, commercial, and custom voice work.
 
-![Projects workspace showing project list alongside the open Midnight Archive audiobook project with script tab](../assets/screenshots/09-project-script-tab-dark.png)
-*The Projects workspace splits into a project index (left) and the selected project workspace (right) with Script, Cast, Review, Timeline, and Export tabs*
+A project combines script structure, rendering defaults, cast assignments, pronunciation rules, performance styles, take history, QC, and deliverable export.
 
----
+## Project structure
 
-## Getting Started with Projects
-
-### Opening Projects
-
-Click **Projects** in the left navigation sidebar. If no project is open, a project picker appears. Select an existing project or create a new one.
-
-The app remembers your last-opened project and restores it automatically on the next launch.
-
-### Creating a Project
-
-1. Click **New** in the project index
-2. Choose a starter template, such as audiobook chapters, voiceover spot, podcast episode, training module, character reel, or blank
-3. Enter a **Project Title**
-4. Optionally assign a client or brand and add a project description
-5. Expand **Production defaults** if you want to set the default voice, language code, or model before creation
-6. Click **Create project**, or click **Create and import script** to open the import sheet immediately after the project is created
-
----
-
-## Project Layout
-
-The Projects workspace is split into a project index and the selected project workspace.
-
-![Project list with three projects — audiobook, voiceover, and podcast — in dark mode](../assets/screenshots/07-projects-list-dark.png)
-*The project index shows kind, segment count, rendered/approved progress, open QC issues, and last-updated date*
-
-The project index includes:
-
-- Saved views: **Active**, **Review**, **Blocked**, **Recent**, and **Archived**
-- Search and sort controls
-- Project rows with kind, segment count, rendered progress, QC status, client details when available, and last-updated date
-- A banner when the current project is hidden by the active search or view filter
-
-The selected project header includes a health strip with the current production state, rendered/approved progress, open QC count, and the next recommended action.
-
-The Project Workspace has these tabs:
-
-| Tab | Content |
-|-----|---------|
-| **Script** | Inline section and segment editor (main editing surface) |
-| **Cast** | Cast bible (character/narrator profiles) |
-| **Review** | Take review, QC, approval workflow |
-| **Timeline** | Waveform timeline and export readiness |
-| **Export** | Readiness checklist, package details, and deliverable export |
-
-Use **More actions** to open project settings, dictionaries, archive actions, and other project-level tools. The **Project Stats Bar** above the script shows section, segment, and draft counts.
-
----
-
-## Script Tab: Sections and Segments
-
-### Structure
-
-A project is organized as a tree:
-
-```
+```text
 Project
-└── Section (Chapter 1, Scene A, etc.)
-    ├── Segment (line/paragraph to render)
+└── Section
+    ├── Segment
     ├── Segment
     └── Segment
 ```
 
-### Working with Sections
+A segment is the smallest independently rendered script unit. Each successful render creates a new take rather than replacing prior audio.
 
-**Add a section:**
-- Click **+ Add Section** at the bottom of the script
+## Create a project
 
-**Rename a section:**
-- Click the pencil icon next to the section title
-- Edit the name and press **Enter** to confirm
+1. Open **Projects**.
+2. Select **New**.
+3. Choose a template or blank project.
+4. Enter a title and optional description.
+5. Optionally assign a client.
+6. Review production defaults.
+7. Create the project or create and immediately import a script.
 
-**Section kinds:**
-- Chapter
-- Scene
-- Folder
-- Intro / Outro
+Client defaults can seed new project settings, but project and segment values can override them.
 
-**Collapse/expand a section:**
-- Click the arrow icon next to the section title to hide or show its segments
+## Project workspace
 
-**Delete a section:**
-- Click the trash icon (requires confirmation)
+| Tab | Purpose |
+|---|---|
+| Script | Sections, segments, text import, AI prep, and rendering |
+| Cast | Cast profiles, auditions, and continuity warnings |
+| Review | Take playback, approve/flag workflow, and QC issues |
+| Timeline | Ordered waveforms, pacing, and readiness |
+| Export | Finishing profile, package readiness, export jobs, and downloads |
 
-### Working with Segments
+## Sections
 
-Each segment represents one individual piece of audio to render — a line of dialogue, a paragraph of narration, etc.
+Sections group related segments into chapters, scenes, folders, intros, outros, or other structural units.
 
-**Add a segment:**
-- Click **+ Add Segment** inside any section
-- Type the segment text and press **Save**
+Common actions:
 
-**Edit a segment:**
-- Click the pencil icon on the segment row
-- Editable fields:
-  - **Text** — The spoken content
-  - **Speaker Label** — Name or role of the speaker (used by Cast system)
-  - **Voice** — Stock voice or custom preset
-  - **Cast Profile** — Link to a named cast profile (overrides voice)
-  - **Performance Style** — Optional style preset for delivery direction
-  - **Language Code** — Override language for this segment
-  - **Provider / Model** — TTS provider and model (e.g., `gemini-3.1-flash-tts-preview`)
-- Click **Save** to apply or **Cancel** to discard
+- Add a section.
+- Rename it.
+- Change its kind.
+- Collapse or expand it.
+- Reorder it.
+- Delete it after confirmation.
 
-**Render a segment:**
-- Click the **Render** button (waveform icon) on a segment row
-- The segment status changes to **Rendering** and updates to **Rendered** when complete
-- Rendered audio becomes a new **take** in the segment's take list
+Deleting a section can affect all child segments; create a portable backup before large destructive edits.
 
-**Delete a segment:**
-- Click the trash icon (requires confirmation)
+## Segments
 
-### Segment Status Badges
+A segment can store or inherit:
 
-| Status | Meaning |
-|--------|---------|
-| **Draft** | Not yet rendered |
-| **Rendering** | Currently being processed |
-| **Rendered** | Audio generated, not yet reviewed |
-| **Approved** | Take is approved for export |
-| **Flagged** | Take has issues, needs re-recording |
-| **Changed** | Text was edited after last render |
+- Script text
+- Speaker label
+- Voice
+- Cast profile
+- Provider
+- Model
+- Language code
+- Accent
+- Performance style
+- Sort order
+- Render status
 
----
+Editing script text after rendering changes the segment to `changed`, indicating that existing audio no longer represents the current text.
 
-## Batch Render
+### Segment states
 
-Click **Render all** in the action bar to render all draft and changed segments at once.
+| State | Meaning |
+|---|---|
+| `draft` | No current render |
+| `rendering` | A render is in progress |
+| `rendered` | Audio exists and awaits review |
+| `approved` | The selected take is approved |
+| `flagged` | The selected take requires attention |
+| `changed` | Script changed after the last render |
+| `failed` | The most recent render attempt failed |
 
-Options:
-- **All draft/changed** — Default; renders only segments that need audio
-- **Force re-render all** — Re-renders every segment regardless of status
+## Model selection
 
-Progress is shown in real time via the **Job Center** drawer. Cancel the job at any time by clicking **Cancel** in the Job Center.
+The frontend loads project model options from the backend provider catalogue rather than maintaining an independent project-model list.
 
----
+Supported TTS models are:
 
-## Text Import
+| Model | Streaming |
+|---|---:|
+| `gemini-3.1-flash-tts-preview` | Yes |
+| `gemini-2.5-flash-preview-tts` | No |
+| `gemini-2.5-pro-preview-tts` | No |
 
-Click **Import** (upload icon in the toolbar) to load a Markdown or plain text file as sections and segments.
+Unknown IDs are rejected with HTTP `422`. The requested provider/model and effective provider/model are stored in take provenance.
 
-How the import works:
-- `# Heading 1` and `## Heading 2` lines become **Section** titles
-- Paragraphs and lines below each heading become **Segments**
-- Import is previewed before applying — review the structure, then confirm
+## Single-segment rendering
 
-You can also paste text directly into the import panel.
+Select **Render** on a segment to create a take synchronously.
 
-On phone-sized screens, Import opens as a focused full-screen sheet. Press **Escape** or use the close button to dismiss it.
+The backend performs the following lifecycle:
 
----
+1. Resolves segment, cast, project, client, and global settings.
+2. Applies pronunciation and performance instructions.
+3. Validates the selected model.
+4. Calls the provider with the request context.
+5. Decodes the returned PCM.
+6. Writes a temporary media file.
+7. Flushes and atomically renames the file.
+8. Analyzes duration, peak, RMS, and clipping.
+9. Persists the take and render provenance.
+10. Creates an automated QC issue when configured.
+11. Marks the segment rendered.
 
-## AI Script Prep
+A segment is not marked rendered unless a take was successfully persisted. If take persistence fails, the newly published audio file is removed.
 
-Click **AI prep** (AI wand icon) to open the AI Script Preparation dialog.
+Closing the request or losing the browser connection cancels provider work where the endpoint is request-bound.
 
-1. Paste raw manuscript text (plain text or Markdown)
-2. Click **Analyze**
-3. Gemini returns a proposed structure including:
-   - Sections with titles
-   - Segments with speaker labels
-   - Speaker candidates (cast profile suggestions)
-   - Pronunciation suggestions
-   - Performance style recommendations
-   - Warnings (e.g., detected formatting issues)
-4. Review the hierarchical preview
-5. Click **Apply** to create all sections and segments at once
+## Batch rendering
 
----
+**Render all** selects eligible draft, changed, or failed segments. A forced render can include segments regardless of current state.
 
-## Takes
+Batch jobs use a bounded worker pool:
 
-Every time a segment is rendered, a new **take** is created. Segments can have multiple takes.
+- Default concurrency: 2
+- Minimum: 1
+- Maximum: 8
+- Request-level concurrency can override the stored default within those limits
 
-**Viewing takes:**
-- Click the take-list indicator (clapperboard icon) on any segment row to expand the take list
+Each worker updates segment state independently. Aggregate progress records completed and failed counts.
 
-**Take list shows:**
-- Take number
-- Voice used
-- Status badge
+Final states are:
+
+- `complete` when every selected segment succeeds
+- `partial` when at least one succeeds and at least one fails
+- `failed` when all fail
+- `cancelled` when the user cancels or the job context ends
+
+Cancellation reaches active Gemini HTTP calls and retry waits. Segments interrupted by cancellation are restored to their original state when possible.
+
+## Retry behavior
+
+Transient provider responses can be retried with cancellable backoff. Authentication failures and repeated provider errors are reported to the key-pool health system rather than treated as generic success.
+
+## Takes and provenance
+
+Every render creates a take containing production evidence such as:
+
+- Provider and model
+- Provider voice and application voice
+- Language
+- Script text
+- System instruction
+- Dictionary hash
+- Prompt hash
+- Render settings JSON
 - Duration
-- Creation timestamp
-- Reviewer notes
+- Peak and RMS levels
+- Clipping result
+- Sample rate, channel count, and format
+- Audio path
+- Status
 
-**Actions per take:**
-- **Play** — Audition the take
-- **Approve** — Mark as ready for export
-- **Flag** — Mark as having issues
-- **Add note** — Attach a reviewer comment
-- **Delete** — Remove the take (double-click to confirm)
+This history supports comparison, auditability, re-review, and reproducible delivery decisions.
 
----
+Take actions include:
 
-## Project Settings
+- Play
+- Approve
+- Flag
+- Add or edit notes
+- Select the best take
+- Delete
 
-Click **More actions** and choose **Project Settings** to open the settings drawer.
+Deleting a take can make its media file reclaimable if no other record references it.
 
-| Setting | Description |
-|---------|-------------|
-| **Default Voice** | Stock voice or custom preset used for new segments |
-| **Default Language** | Language code for new segments |
-| **Default Model** | TTS model: 3.1 Flash (default), 2.5 Flash, 2.5 Pro |
-| **Default Style** | Performance style preset applied to new segments |
+## Text import
 
-These defaults apply to newly created segments. Individual segments can override any setting.
+Import supports Markdown and plain text.
 
-Settings are grouped by **Voice defaults**, **Language and model**, and **Performance style**. **Save settings** is disabled until a setting changes; closing with unsaved changes prompts for confirmation.
+Typical mapping:
 
----
+- Headings become sections.
+- Paragraphs or lines become segments.
+- A preview is shown before changes are applied.
+
+Review the preview carefully because imported structure can create many records at once.
+
+## AI script preparation
+
+AI prep can propose:
+
+- Section structure
+- Segment boundaries
+- Speaker labels
+- Speaker candidates
+- Pronunciation candidates
+- Performance suggestions
+- Formatting warnings
+
+The proposed result is reviewable before application. Applying it creates the corresponding project records.
+
+## Project defaults
+
+Project settings can define:
+
+- Default voice
+- Default provider/model
+- Fallback provider/model
+- Default language
+- Default preset
+- Default performance style
+- Default export profile
+
+Segments can override project defaults. Cast-profile assignments can provide additional voice and performance context.
+
+## Pronunciation dictionaries
+
+Enabled global entries are evaluated before enabled project entries. The applied pronunciation set contributes to the take's dictionary hash.
+
+Use preview and test renders before launching a large batch.
+
+## Performance styles
+
+Styles can be global or project-scoped and can express pacing, energy, emotion, articulation, pause density, and director notes.
+
+Style changes do not retroactively alter existing takes. Re-render changed segments to produce audio with the new direction.
+
+## Cast profiles
+
+Cast profiles associate named characters or roles with voice and performance defaults. Continuity checks identify segments whose current assignment differs from the linked cast profile.
+
+See [Cast Bible](cast-bible.md).
+
+## Review and QC
+
+Rendered takes can be approved, flagged, and linked to QC issues. Automated clipping checks can add high-severity volume issues.
+
+See [Review & Export](review-export.md).
 
 ## Export
 
-The **Export** tab is a full-width workflow page rather than a small modal. It includes:
+The Export tab packages eligible takes into a ZIP with per-segment WAV files, a project master WAV, project metadata, cast data, pronunciation data, QC CSV, and render provenance.
 
-- Finishing profile selection
-- Package summary and audio scope
-- Export readiness status
-- A readiness checklist for missing audio, unapproved takes, and open QC issues
-- Recent export jobs when available
+Finishing profiles control silence trim, threshold, padding, inter-segment spacing, and peak normalization. Current output is 24 kHz, 16-bit, mono WAV.
 
-The export action remains disabled until the project meets the readiness requirements.
+## Job Center
 
----
+The Job Center receives persisted progress events over WebSocket. Each connected client has a bounded queue; a slow or unhealthy browser is disconnected without blocking render workers.
 
-## Project Statistics
+Jobs survive page reloads through persisted progress records, although a process restart cannot resume an in-flight provider request from its midpoint.
 
-The **Stats Bar** above the script editor shows live counts:
+## Recommended workflow
 
-- **Sections** — Total sections in the project
-- **Segments** — Total segments
-- **Drafts** — Segments not yet rendered (need audio)
+1. Create or import the script.
+2. Define project defaults.
+3. Configure cast, pronunciation, and performance styles.
+4. Test representative segments.
+5. Batch-render eligible segments.
+6. Review and approve takes.
+7. Resolve or accept QC issues.
+8. Select a finishing profile.
+9. Inspect the stitched master.
+10. Create and retain the final ZIP.
+11. Create a portable application backup.
 
----
+## Related guides
 
-## Client Workspaces
-
-Organize projects under named client brands.
-
-1. Click **Clients** in the sidebar
-2. Create a client with a name, brand notes, and default voice/model settings
-3. When creating a new project, assign it to a client
-
-Client defaults (voice, model, language) are inherited by new projects created under that client.
-
----
-
-## Performance Styles
-
-Performance Styles are reusable direction presets that shape how the TTS model delivers text.
-
-| Field | Options |
-|-------|---------|
-| **Pacing** | Slow, Measured, Conversational, Brisk, Rapid |
-| **Energy** | Subdued, Calm, Moderate, Engaged, High |
-| **Emotion** | Neutral, Warm, Authoritative, Intimate, Dramatic, Playful, Suspenseful |
-| **Articulation** | Relaxed, Clear, Crisp, Heightened |
-| **Pause Density** | Sparse, Moderate, Frequent, Dramatic |
-| **Director Notes** | Free-text guidance injected into the system instruction |
-
-**Creating a style:**
-1. Click **+ New Style** in the Style Preset Picker dropdown, or
-2. Go to **Settings → Performance Styles**
-
-Styles can be **global** (available in all projects) or **project-scoped** (local to one project).
-
----
-
-## Pronunciation Dictionaries
-
-Per-project word/phrase → pronunciation overrides. See the [Settings & Administration](settings-administration.md) page for full documentation on both project-scoped and global pronunciation dictionaries.
-
----
-
-## Next Steps
-
-| Guide | Description |
-|-------|-------------|
-| [Cast Bible](cast-bible.md) | Set up character voice profiles |
-| [Review & Export](review-export.md) | Review takes, QC, and export |
-| [Settings & Administration](settings-administration.md) | Pronunciation, styles, and global settings |
+- [Cast Bible](cast-bible.md)
+- [Review & Export](review-export.md)
+- [Settings & Administration](settings-administration.md)
