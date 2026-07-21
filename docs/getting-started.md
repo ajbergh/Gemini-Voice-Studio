@@ -46,6 +46,8 @@ npm run dev
 
 The frontend listens on `http://localhost:4000` and proxies `/api` requests to the backend at `http://localhost:8080`.
 
+The desktop default bind host is `127.0.0.1`, which keeps the server local to the machine. Use `--host 0.0.0.0` or `GVS_HOST=0.0.0.0` only when the server must accept connections through a container or trusted network.
+
 ## First launch
 
 1. Open `http://localhost:4000` in development or `http://localhost:8080` from a production binary.
@@ -146,6 +148,7 @@ Configuration precedence is:
 | Flag | Description |
 |---|---|
 | `--config PATH` | Optional JSON configuration file |
+| `--host HOST` | HTTP bind host; default `127.0.0.1` |
 | `--port N` | HTTP server port |
 | `--data-dir PATH` | Persistent application root |
 | `--db PATH` | Explicit SQLite path |
@@ -160,6 +163,7 @@ Configuration precedence is:
 | Variable | Meaning |
 |---|---|
 | `GVS_CONFIG` | JSON configuration path |
+| `GVS_HOST` | HTTP bind host |
 | `GVS_PORT` | HTTP port |
 | `GVS_DATA_DIR` | Persistent application root |
 | `GVS_DB_PATH` | SQLite path |
@@ -172,6 +176,7 @@ Example JSON file:
 
 ```json
 {
+  "host": "127.0.0.1",
   "port": 8080,
   "data_dir": "/srv/gemini-voice-studio",
   "db_path": "/srv/gemini-voice-studio/data.db",
@@ -191,7 +196,7 @@ The passphrase is not serialized. Supply it through `GVS_PASSPHRASE` or `--passp
 | macOS | `~/Library/Application Support/gemini-voice-studio` |
 | Linux | `$XDG_DATA_HOME/gemini-voice-studio` or `~/.local/share/gemini-voice-studio` |
 
-The directory contains the SQLite database and generated media. Existing `gemini-voice-library` and `audio_cache` directories are reused when present and no new-name directory exists.
+The directory contains the SQLite database, generated media, and `export_cache/`. Existing `gemini-voice-library` and `audio_cache` directories are reused when present and no new-name directory exists.
 
 Do not copy only `data.db` when migrating an installation. The media directory contains durable audio and the installation salt used by encrypted API-key rows.
 
@@ -204,6 +209,7 @@ docker compose up --build
 The Compose configuration:
 
 - Publishes port `8080`.
+- Binds the server to `0.0.0.0` inside the container.
 - Mounts a named volume at `/home/app/data`.
 - Runs the application as a non-root user.
 - Disables browser opening.
@@ -215,6 +221,8 @@ Example:
 ```bash
 GVS_PASSPHRASE='replace-with-a-secret' docker compose up --build
 ```
+
+Publishing the container port makes the application reachable according to the Docker host's firewall and network configuration. The application does not provide TLS or user authentication; do not expose it directly to an untrusted network.
 
 ## Backup and restore
 
