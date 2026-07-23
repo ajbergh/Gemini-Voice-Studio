@@ -16,7 +16,7 @@
   "dependencies": {
     "@google/genai": "^1.31.0",
     "framer-motion": "^12.42.2",
-    "lucide-react": "^0.556.0",
+    "lucide-react": "^1.25.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-markdown": "9"
