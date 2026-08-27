@@ -188,25 +188,47 @@ const ScriptReaderModal: React.FC<ScriptReaderModalProps> = ({ voices, customPre
   };
 
   // Auto-resize textarea to fit content up to max-height
+  const lastAutoHeightRef = useRef('');
   useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
+    // If the height no longer matches what we last set, the user manually
+    // dragged the resize handle — respect that instead of overwriting it.
+    if (textarea.style.height !== lastAutoHeightRef.current) {
+      setHighlighterScrollTop(textarea.scrollTop);
+      return;
+    }
+    const prevScrollTop = textarea.scrollTop;
     textarea.style.height = 'auto';
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 384)}px`;
+    const nextHeight = `${Math.min(textarea.scrollHeight, 384)}px`;
+    textarea.style.height = nextHeight;
+    lastAutoHeightRef.current = nextHeight;
+    // Setting height to 'auto' collapses the box and resets scrollTop; restore it
+    // so typing further down a long script doesn't snap the view back to the top.
+    textarea.scrollTop = prevScrollTop;
     setHighlighterScrollTop(textarea.scrollTop);
   }, [script]);
+
+  /**
+   * Replace [rangeStart, rangeEnd) of the script with `text` as a native edit
+   * (via execCommand) rather than only updating React state directly. Programmatic
+   * `.value` writes are invisible to the browser's undo stack, so Templates,
+   * Recents, Format, and tag-insertion would otherwise make Ctrl/Cmd+Z a no-op.
+   */
+  const applyScriptEdit = (text: string, rangeStart: number, rangeEnd: number) => {
+    const textarea = textareaRef.current;
+    if (!textarea) { setScript(script.slice(0, rangeStart) + text + script.slice(rangeEnd)); return; }
+    textarea.focus();
+    textarea.setSelectionRange(rangeStart, rangeEnd);
+    if (!document.execCommand('insertText', false, text)) {
+      setScript(script.slice(0, rangeStart) + text + script.slice(rangeEnd));
+    }
+  };
 
   const handleInsertTag = (tag: string) => {
     const textarea = textareaRef.current;
     if (!textarea) return;
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    const newText = script.substring(0, start) + tag + ' ' + script.substring(end);
-    setScript(newText);
-    requestAnimationFrame(() => {
-      textarea.selectionStart = textarea.selectionEnd = start + tag.length + 1;
-      textarea.focus();
-    });
+    applyScriptEdit(`${tag} `, textarea.selectionStart, textarea.selectionEnd);
   };
 
   useEffect(() => {
@@ -266,7 +288,7 @@ const ScriptReaderModal: React.FC<ScriptReaderModalProps> = ({ voices, customPre
     setIsFormatting(true);
     try {
       const formatted = await formatScript(script);
-      if (isMountedRef.current) setScript(formatted);
+      if (isMountedRef.current) applyScriptEdit(formatted, 0, script.length);
     } catch (err) {
       console.error('Format script error:', err);
     } finally {
@@ -563,7 +585,7 @@ const ScriptReaderModal: React.FC<ScriptReaderModalProps> = ({ voices, customPre
                           {recentScripts.map((s, idx) => (
                             <button
                               key={idx}
-                              onClick={() => { setScript(s); setShowRecents(false); }}
+                              onClick={() => { applyScriptEdit(s, 0, script.length); setShowRecents(false); }}
                               className="w-full text-left px-3 py-2 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors border-b border-zinc-100 dark:border-zinc-700 last:border-0"
                             >
                               <span className="text-xs text-zinc-700 dark:text-zinc-300 line-clamp-2">{s.slice(0, 120)}{s.length > 120 ? '...' : ''}</span>
@@ -590,7 +612,7 @@ const ScriptReaderModal: React.FC<ScriptReaderModalProps> = ({ voices, customPre
                           <button
                             key={idx}
                             onClick={() => {
-                              setScript(tmpl.content);
+                              applyScriptEdit(tmpl.content, 0, script.length);
                               setShowTemplates(false);
                               if (tmpl.category === 'Dialogue' && mode !== 'dialogue') setMode('dialogue');
                             }}
