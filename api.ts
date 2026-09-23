@@ -782,6 +782,14 @@ export function connectProgress(
   onEvent: (event: ProgressEvent) => void,
   onStatusChange?: (status: ProgressConnectionStatus) => void,
 ): () => void {
+  // Wails v2's asset server supports HTTP requests but not WebSockets. The
+  // native shell therefore relies on the existing persisted-job polling path.
+  // Keep the connection state explicit so the Job Center can explain why live
+  // updates are unavailable instead of repeatedly attempting a bad socket URL.
+  if (window.location.protocol === 'wails:' || window.location.hostname === 'wails.localhost') {
+    onStatusChange?.('disconnected');
+    return () => {};
+  }
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = `${protocol}//${window.location.host}/api/ws/progress`;
   let ws: WebSocket | null = null;

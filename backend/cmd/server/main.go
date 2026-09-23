@@ -19,12 +19,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/application"
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/buildinfo"
 	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/config"
-	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/crypto"
-	fe "github.com/ajbergh/gemini-voice-gen-tts/backend/internal/embed"
-	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/server"
-	"github.com/ajbergh/gemini-voice-gen-tts/backend/internal/store"
 )
 
 func main() {
@@ -114,33 +111,14 @@ func main() {
 		level = slog.LevelInfo
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
-	if err := cfg.EnsureDataDir(); err != nil {
-		slog.Error("failed to create data directory", "error", err)
-		os.Exit(1)
-	}
-
-	// The installation salt is stored beside durable generated media so portable
-	// backups capture both encrypted rows and the KDF metadata required to unlock them.
-	cryptoKey, err := crypto.DeriveKey(cfg.Passphrase, cfg.AudioCacheDir)
-	if err != nil {
-		slog.Error("failed to derive encryption key", "error", err)
-		os.Exit(1)
-	}
-	st, err := store.New(cfg.DBPath)
-	if err != nil {
-		slog.Error("failed to open database", "error", err)
-		os.Exit(1)
-	}
-	defer st.Close()
-
-	frontendFS := fe.FrontendFS()
 	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
-	srv := server.New(addr, st, cryptoKey, frontendFS, cfg.AudioCacheDir)
-	httpServer := &http.Server{
-		Addr: addr, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout: 30 * time.Second, WriteTimeout: 0,
-		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
+	app, err := application.New(cfg)
+	if err != nil {
+		slog.Error("failed to initialize application", "error", err)
+		os.Exit(1)
 	}
+	defer app.Close()
+	httpServer := app.NewHTTPServer(addr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -168,7 +146,7 @@ func main() {
 	slog.Info("starting server",
 		"addr", addr, "url", url, "db", cfg.DBPath, "audio_dir", cfg.AudioCacheDir,
 		"version", buildinfo.Version, "commit", buildinfo.Commit,
-		"schema", st.SchemaVersion(),
+		"schema", app.Store.SchemaVersion(),
 	)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server error", "error", err)

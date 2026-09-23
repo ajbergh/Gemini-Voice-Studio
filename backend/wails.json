@@ -1,0 +1,17 @@
+{
+  "version": "2",
+  "name": "gemini-voice-studio",
+  "outputfilename": "gemini-voice-studio.exe",
+  "assetdir": "../dist",
+  "frontend:dir": "..",
+  "frontend:install": "npm ci",
+  "frontend:build": "npm run build",
+  "build:tags": "",
+  "info": {
+    "companyName": "ajbergh",
+    "productName": "Gemini Voice Studio",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright 2026 ajbergh",
+    "comments": "Native Windows desktop build for Gemini Voice Studio"
+  }
+}

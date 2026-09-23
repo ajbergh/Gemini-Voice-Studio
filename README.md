@@ -107,6 +107,17 @@ Each platform script runs `npm ci`, TypeScript validation, the Vite production b
 .\scripts\build-windows.ps1 -Clean
 ```
 
+For a native Windows WebView2 desktop build, install the Wails v2 CLI and run:
+
+```powershell
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.15.0
+.\scripts\build-windows-wails.ps1
+```
+
+This produces `bin/gemini-voice-studio-windows-amd64-wails.exe`. It requires
+Windows, a Wails-compatible C compiler, and the WebView2 runtime. The standard
+Windows script remains available for the portable HTTP-server executable.
+
 ### Linux
 
 ```bash
