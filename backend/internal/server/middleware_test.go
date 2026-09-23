@@ -28,6 +28,18 @@ func TestOriginProtectionMiddleware(t *testing.T) {
 		}
 	})
 
+	t.Run("allows the Wails private application origin", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/keys", nil)
+		req.Header.Set("Origin", "http://wails.localhost")
+		res := httptest.NewRecorder()
+
+		handler.ServeHTTP(res, req)
+
+		if res.Code != http.StatusNoContent {
+			t.Fatalf("expected Wails origin to pass, got %d", res.Code)
+		}
+	})
+
 	t.Run("allows exact same origin for configured host", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "http://studio.internal:8080/api/keys", nil)
 		req.Header.Set("Origin", "http://studio.internal:8080")

@@ -46,11 +46,12 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// corsMiddleware adds CORS headers for the localhost development frontend.
+// corsMiddleware adds CORS headers for localhost development and the Wails
+// private application origin.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" && isLocalhostOrigin(origin) {
+		if origin != "" && isTrustedBrowserOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Add("Vary", "Origin")
 		}
@@ -67,7 +68,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 // originProtectionMiddleware rejects unsafe browser requests unless their
-// Origin/Referer is localhost or exactly matches the request host. Exact
+// Origin/Referer is localhost, the Wails private origin, or exactly matches the request host. Exact
 // same-origin matching supports the embedded app behind Docker or a trusted
 // reverse proxy without allowing arbitrary cross-site writes.
 func originProtectionMiddleware(next http.Handler) http.Handler {
@@ -105,7 +106,7 @@ func requestHasTrustedOrigin(r *http.Request) bool {
 }
 
 func isTrustedRequestOrigin(rawOrigin, requestHost string) bool {
-	if isLocalhostOrigin(rawOrigin) {
+	if isTrustedBrowserOrigin(rawOrigin) {
 		return true
 	}
 	parsed, err := url.Parse(rawOrigin)
@@ -113,6 +114,21 @@ func isTrustedRequestOrigin(rawOrigin, requestHost string) bool {
 		return false
 	}
 	return requestHost != "" && strings.EqualFold(parsed.Host, requestHost)
+}
+
+// isTrustedBrowserOrigin allows the local development origins and Wails'
+// private application origin. Wails proxies requests to the loopback backend,
+// so the browser origin is not necessarily the backend listener's Host.
+func isTrustedBrowserOrigin(origin string) bool {
+	return isLocalhostOrigin(origin) || isWailsOrigin(origin)
+}
+
+func isWailsOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	return strings.EqualFold(parsed.Hostname(), "wails.localhost")
 }
 
 // isLocalhostOrigin checks if an origin is localhost or a loopback IP.

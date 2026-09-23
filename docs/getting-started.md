@@ -101,6 +101,25 @@ The platform scripts run a deterministic frontend install, TypeScript validation
 .\scripts\build-windows.ps1 -Clean
 ```
 
+The repository also provides an optional Windows-native Wails build. It opens
+the same React application in a native WebView2 window while keeping the Go
+API and SQLite data on a private loopback listener:
+
+```powershell
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.15.0
+.\scripts\build-windows-wails.ps1
+.\scripts\build-windows-wails.ps1 -Arch arm64
+.\scripts\build-windows-wails.ps1 -Clean
+```
+
+The native build requires Windows, the Wails v2 CLI, a C compiler supported by
+Wails, and the WebView2 runtime. It produces
+`bin/gemini-voice-studio-windows-amd64-wails.exe` (or the selected architecture).
+The native shell uses the existing persisted-job polling path for job status
+because Wails v2's asset transport does not support WebSockets. The existing
+`build-windows.ps1` script remains the portable HTTP-server build with live
+WebSocket progress updates.
+
 ### Linux
 
 ```bash
